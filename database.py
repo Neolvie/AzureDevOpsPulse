@@ -399,6 +399,9 @@ class Database:
                       COUNT(*) AS commit_count,
                       COUNT(DISTINCT DATE(author_date)) AS active_days,
                       SUM(changes_add+changes_edit+changes_delete) AS total_changes,
+                      SUM(changes_add) AS total_add,
+                      SUM(changes_edit) AS total_edit,
+                      SUM(changes_delete) AS total_delete,
                       MAX(author_date) AS last_commit
                FROM cc
                WHERE author_date BETWEEN ? AND ? AND is_merge=0{emp_sql}
@@ -463,6 +466,11 @@ class Database:
                                 MAX(author_name)) AS author_name
                    FROM cc WHERE canonical_email=?""",
                 (email,),
+            ),
+            "active_weeks": self._scalar(
+                f"""{_ALIAS_CTE}SELECT COUNT(DISTINCT strftime('%Y-%W', author_date))
+                   FROM cc WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0""",
+                (email, from_date, to_date),
             ),
             "aliases": self._q(
                 """SELECT alias_email FROM employee_aliases WHERE primary_email=?""",

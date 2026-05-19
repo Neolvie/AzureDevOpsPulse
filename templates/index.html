@@ -72,7 +72,13 @@
 <div class="panel">
   <div class="panel-header">
     <span class="panel-title">Разработчики</span>
-    <small id="dev-count" style="color:var(--text-muted);font-size:.8rem"></small>
+    <div style="display:flex;align-items:center;gap:10px">
+      <small id="dev-count" style="color:var(--text-muted);font-size:.8rem"></small>
+      <div class="chart-toggle">
+        <button class="btn-toggle active" id="sort-desc" onclick="setSortDir('desc')">Топ ↓</button>
+        <button class="btn-toggle"        id="sort-asc"  onclick="setSortDir('asc')">Лоу ↑</button>
+      </div>
+    </div>
   </div>
   <div class="panel-body" style="padding:0">
     <div class="table-wrap" id="dev-table">
@@ -172,43 +178,101 @@ async function loadOverview() {
   }
 }
 
+// ── Composite score ───────────────────────────────────────────────────────────
+// Weights: commits 35%, weighted-changes 30%, active-days 25%, creation-ratio 10%
+// Changes are weighted: additions×1.0, edits×0.7, deletions×0.5
+// All components normalized relative to the best performer in the visible set.
+function computeScores(devs) {
+  const wc = d => (d.total_add||0)*1.0 + (d.total_edit||0)*0.7 + (d.total_delete||0)*0.5;
+  const maxCommits = Math.max(...devs.map(d => d.commit_count||0), 1);
+  const maxDays    = Math.max(...devs.map(d => d.active_days||0),  1);
+  const maxWC      = Math.max(...devs.map(wc), 1);
+
+  return devs.map(d => {
+    const commitScore    = (d.commit_count||0)  / maxCommits * 100;
+    const activityScore  = (d.active_days||0)   / maxDays    * 100;
+    const changeScore    = wc(d)                / maxWC      * 100;
+    const total          = d.total_changes || 0;
+    const creationScore  = total > 0 ? (d.total_add||0) / total * 100 : 50;
+    const score = Math.round(commitScore*0.35 + changeScore*0.30 + activityScore*0.25 + creationScore*0.10);
+    return { ...d, score };
+  });
+}
+
+function scoreColor(s) {
+  if (s >= 70) return '#3fb950';
+  if (s >= 40) return '#d29922';
+  return '#f85149';
+}
+
+let _allDevs = [];
+let _sortDir = 'desc';
+
+function setSortDir(dir) {
+  _sortDir = dir;
+  document.getElementById('sort-desc').classList.toggle('active', dir === 'desc');
+  document.getElementById('sort-asc').classList.toggle('active', dir === 'asc');
+  renderDevTable();
+}
+
+function renderDevTable() {
+  const wrap = document.getElementById('dev-table');
+  if (!_allDevs.length) { empty(wrap); return; }
+  const sorted = [..._allDevs].sort((a,b) => _sortDir === 'desc' ? b.score - a.score : a.score - b.score);
+  const maxC = Math.max(...sorted.map(d => d.commit_count), 1);
+  wrap.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Разработчик</th>
+        <th title="Компонент: коммиты 35%, изменения 30%, активность 25%, создание файлов 10%">Рейтинг ↕</th>
+        <th>Коммиты</th>
+        <th>Активных дней</th>
+        <th>Добавлено / Изменено / Удалено</th>
+        <th>Последний коммит</th>
+      </tr></thead>
+      <tbody>${sorted.map((d,i) => `
+        <tr style="cursor:pointer" onclick="location.href='/developer/${encodeURIComponent(d.author_email)}'">
+          <td>
+            <div class="dev-cell">
+              <div style="color:var(--text-muted);font-size:.78rem;min-width:20px;text-align:right;margin-right:4px">${i+1}</div>
+              <div class="avatar" style="background:${avatarColor(d.author_email)}">${avatar(d.author_name)}</div>
+              <div>
+                <div class="dev-name">${d.author_name || d.author_email}</div>
+                <div class="dev-email">${d.author_email}</div>
+              </div>
+            </div>
+          </td>
+          <td style="white-space:nowrap">
+            <span style="font-weight:700;font-size:1rem;color:${scoreColor(d.score)}">${d.score}</span>
+            <span style="color:var(--text-muted);font-size:.75rem">/100</span>
+            <div class="progress" style="margin-top:3px;width:80px">
+              <div class="progress-bar" style="width:${d.score}%;background:${scoreColor(d.score)}"></div>
+            </div>
+          </td>
+          <td>
+            ${fmt(d.commit_count)}
+            <div class="progress"><div class="progress-bar" style="width:${Math.round((d.commit_count||0)/maxC*100)}%"></div></div>
+          </td>
+          <td>${fmt(d.active_days)}</td>
+          <td style="font-size:.82rem">
+            <span class="changes-add">+${fmt(d.total_add||0)}</span>
+            <span style="color:var(--text-muted)"> / </span>
+            <span style="color:#388bfd">${fmt(d.total_edit||0)}</span>
+            <span style="color:var(--text-muted)"> / </span>
+            <span class="changes-del">-${fmt(d.total_delete||0)}</span>
+          </td>
+          <td>${fmtDate(d.last_commit)}</td>
+        </tr>
+      `).join('')}</tbody>
+    </table>`;
+}
+
 async function loadDevs() {
   try {
     const devs = await api('/api/developers');
     document.getElementById('dev-count').textContent = `${devs.length} чел.`;
-    const wrap = document.getElementById('dev-table');
-    if (!devs.length) { empty(wrap); return; }
-    const maxC = Math.max(...devs.map(d => d.commit_count));
-    wrap.innerHTML = `
-      <table>
-        <thead><tr>
-          <th>Разработчик</th>
-          <th>Коммиты</th>
-          <th>Активных дней</th>
-          <th>Изменений</th>
-          <th>Последний коммит</th>
-        </tr></thead>
-        <tbody>${devs.map(d => `
-          <tr style="cursor:pointer" onclick="location.href='/developer/${encodeURIComponent(d.author_email)}'">
-            <td>
-              <div class="dev-cell">
-                <div class="avatar" style="background:${avatarColor(d.author_email)}">${avatar(d.author_name)}</div>
-                <div>
-                  <div class="dev-name">${d.author_name || d.author_email}</div>
-                  <div class="dev-email">${d.author_email}</div>
-                </div>
-              </div>
-            </td>
-            <td>
-              ${fmt(d.commit_count)}
-              <div class="progress"><div class="progress-bar" style="width:${Math.round(d.commit_count/maxC*100)}%"></div></div>
-            </td>
-            <td>${fmt(d.active_days)}</td>
-            <td>${fmt(d.total_changes)}</td>
-            <td>${fmtDate(d.last_commit)}</td>
-          </tr>
-        `).join('')}</tbody>
-      </table>`;
+    _allDevs = computeScores(devs);
+    renderDevTable();
   } catch(e) {
     document.getElementById('dev-table').innerHTML = `<div class="alert alert-error">${e.message}</div>`;
   }

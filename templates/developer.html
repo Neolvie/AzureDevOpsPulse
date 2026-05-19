@@ -86,6 +86,27 @@
     <div class="panel-body"><div class="chart-wrap"><canvas id="chart-repos" height="200"></canvas></div></div>
   </div>
 </div>
+
+<!-- Text report -->
+<div class="panel">
+  <div class="panel-header">
+    <span class="panel-title">Текстовый отчёт</span>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-secondary" style="padding:4px 10px;font-size:.8rem" onclick="generateReport()">Сгенерировать</button>
+      <button class="btn btn-primary"   style="padding:4px 10px;font-size:.8rem" id="btn-copy-report" onclick="copyReport()" disabled>Скопировать</button>
+    </div>
+  </div>
+  <div class="panel-body">
+    <div style="font-size:.82rem;color:var(--text-muted);margin-bottom:10px">
+      Готовый текст для вставки в ChatGPT / Claude — обсудите активность, паттерны, причины низких показателей.
+    </div>
+    <textarea id="report-text" readonly
+      style="width:100%;min-height:320px;background:var(--surface2);border:1px solid var(--border);
+             border-radius:var(--radius-sm);color:var(--text);font-family:monospace;font-size:.82rem;
+             padding:12px;resize:vertical;outline:none;line-height:1.6"
+      placeholder="Нажмите «Сгенерировать» для создания отчёта..."></textarea>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -93,6 +114,7 @@
 const EMAIL = '{{ email }}';
 let dailyData = [];
 let chartFreq = null, chartSize = null, chartPrs = null, chartRepos = null;
+let _devData = null;
 let granularity = 'day';
 let granularity2 = 'day';
 
@@ -155,6 +177,7 @@ function renderFreqChart(gran) {
 async function loadDeveloper() {
   try {
     const data = await api(`/api/developer/${encodeURIComponent(EMAIL)}`);
+    _devData = data;
     const info = data.info?.[0] || {};
     const sum  = data.summary?.[0] || {};
 
@@ -224,6 +247,111 @@ document.querySelectorAll('.btn-toggle[data-gran2]').forEach(btn => {
     renderSizeChart(granularity2);
   });
 });
+
+function generateReport() {
+  if (!_devData) { alert('Сначала дождитесь загрузки данных'); return; }
+  const info = _devData.info?.[0] || {};
+  const sum  = _devData.summary?.[0] || {};
+  const repos = _devData.repos || [];
+  const aliases = (_devData.aliases || []).map(a => a.alias_email);
+
+  const name     = info.author_name || EMAIL;
+  const fromD    = State.fromDate || '—';
+  const toD      = State.toDate   || '—';
+  const periodDays = (State.fromDate && State.toDate)
+    ? Math.round((new Date(State.toDate) - new Date(State.fromDate)) / 86400000)
+    : '—';
+  const periodWeeks = typeof periodDays === 'number' ? Math.round(periodDays / 7) : '—';
+
+  const commits   = sum.commit_count  || 0;
+  const activeDays = sum.active_days  || 0;
+  const totalAdd  = sum.total_add     || 0;
+  const totalEdit = sum.total_edit    || 0;
+  const totalDel  = sum.total_delete  || 0;
+  const totalChg  = (sum.total_add||0) + (sum.total_edit||0) + (sum.total_delete||0);
+  const avgChg    = commits > 0 ? Math.round(totalChg / commits) : 0;
+  const activeWeeks = _devData.active_weeks || 0;
+
+  const pct = (n, total) => total > 0 ? ` (${Math.round(n/total*100)}%)` : '';
+  const actPct = typeof periodDays === 'number' && periodDays > 0
+    ? ` (${Math.round(activeDays/periodDays*100)}%)`
+    : '';
+  const wkPct = typeof periodWeeks === 'number' && periodWeeks > 0
+    ? ` (${Math.round(activeWeeks/periodWeeks*100)}%)`
+    : '';
+
+  const avgPerDay = typeof periodDays === 'number' && periodDays > 0
+    ? (commits / periodDays).toFixed(2)
+    : '—';
+  const avgPerWorkDay = typeof periodDays === 'number' && periodDays > 0
+    ? (commits / (periodDays * 5/7)).toFixed(2)
+    : '—';
+
+  const prMap = { completed: 0, active: 0, abandoned: 0 };
+  (_devData.pr_stats || []).forEach(r => { if (r.status in prMap) prMap[r.status] = r.count; });
+  const prTotal = prMap.completed + prMap.active + prMap.abandoned;
+  const mergeRate = prTotal > 0 ? Math.round(prMap.completed / prTotal * 100) : 0;
+
+  const repoLines = repos.slice(0, 7).map((r, i) =>
+    `  ${i+1}. ${r.repo_name}: ${r.commit_count} ком., ${r.total_changes} изм.`
+  ).join('\n');
+
+  const aliasLine = aliases.length
+    ? `\nДополнительные учётные записи: ${aliases.join(', ')}`
+    : '';
+
+  const lines = [
+    `=== Отчёт по активности разработчика ===`,
+    ``,
+    `Разработчик : ${name}`,
+    `Email       : ${EMAIL}${aliasLine}`,
+    `Период      : ${fromD} — ${toD} (${periodDays} дн., ${periodWeeks} нед.)`,
+    ``,
+    `─── КОММИТЫ ────────────────────────────`,
+    `Всего коммитов    : ${commits}`,
+    `Среднее в день    : ${avgPerDay}`,
+    `Среднее в раб.день: ${avgPerWorkDay}  (с учётом 5/7 раб. дней)`,
+    ``,
+    `─── АКТИВНОСТЬ ─────────────────────────`,
+    `Активных дней  : ${activeDays} из ${periodDays}${actPct}`,
+    `Активных недель: ${activeWeeks} из ${periodWeeks}${wkPct}`,
+    `Последний коммит: ${sum.last_commit ? new Date(sum.last_commit).toLocaleDateString('ru-RU') : '—'}`,
+    ``,
+    `─── ИЗМЕНЕНИЯ ФАЙЛОВ ───────────────────`,
+    `Всего изменений : ${totalChg.toLocaleString('ru-RU')}`,
+    `Среднее на коммит: ${avgChg}`,
+    `  • Создание  : ${totalAdd.toLocaleString('ru-RU')}${pct(totalAdd, totalChg)}`,
+    `  • Изменение : ${totalEdit.toLocaleString('ru-RU')}${pct(totalEdit, totalChg)}`,
+    `  • Удаление  : ${totalDel.toLocaleString('ru-RU')}${pct(totalDel, totalChg)}`,
+    ``,
+    `─── PULL REQUESTS ──────────────────────`,
+    prTotal > 0
+      ? [`Создано PR: ${prTotal}`,
+         `  • Завершено : ${prMap.completed}`,
+         `  • Активных  : ${prMap.active}`,
+         `  • Отклонено : ${prMap.abandoned}`,
+         `Merge rate  : ${mergeRate}%`].join('\n')
+      : `Данные по PR отсутствуют (требуется пересинхронизация)`,
+    ``,
+    `─── ТОП РЕПОЗИТОРИЕВ ───────────────────`,
+    repoLines || '  нет данных',
+    ``,
+    `════════════════════════════════════════`,
+  ].join('\n');
+
+  document.getElementById('report-text').value = lines;
+  document.getElementById('btn-copy-report').disabled = false;
+}
+
+function copyReport() {
+  const ta = document.getElementById('report-text');
+  ta.select();
+  navigator.clipboard?.writeText(ta.value).catch(() => document.execCommand('copy'));
+  const btn = document.getElementById('btn-copy-report');
+  const orig = btn.textContent;
+  btn.textContent = '✓ Скопировано';
+  setTimeout(() => { btn.textContent = orig; }, 2000);
+}
 
 onDateChange(loadDeveloper);
 document.addEventListener('DOMContentLoaded', loadDeveloper);
