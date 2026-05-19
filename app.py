@@ -229,6 +229,15 @@ def api_save_selected_projects():
     return _ok({"saved": len(ids)})
 
 
+@app.route("/api/clear-data", methods=["POST"])
+def api_clear_data():
+    if get_sync_status()["running"]:
+        return _err("Нельзя очищать данные во время синхронизации", 409)
+    db.clear_data()
+    log.info("Data cleared via API")
+    return _ok({"cleared": True})
+
+
 @app.route("/api/sync", methods=["POST"])
 def api_sync():
     if get_sync_status()["running"]:

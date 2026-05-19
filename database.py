@@ -100,6 +100,17 @@ class Database:
             conn.executescript(SCHEMA)
         log.info("Database schema ready: %s", self.db_path)
 
+    def clear_data(self):
+        with self._conn() as conn:
+            conn.executescript("""
+                DELETE FROM commits;
+                DELETE FROM pull_requests;
+                DELETE FROM sync_log;
+                DELETE FROM repositories;
+                DELETE FROM projects;
+            """)
+        log.info("All data cleared from DB")
+
     # ── settings ────────────────────────────────────────────────────────────
 
     def save_settings(self, tfs_url: str, collection: str, pat: str):
