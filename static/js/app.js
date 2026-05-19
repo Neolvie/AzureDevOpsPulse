@@ -260,10 +260,15 @@ class DevPicker {
     this.dropdown = this.container.querySelector('.dev-picker-dropdown');
     this.tags = this.container.querySelector('.selected-devs');
 
-    this.input.addEventListener('focus', () => this.dropdown.classList.add('open'));
+    this.input.addEventListener('focus', () => {
+      this._renderDropdown();
+      this.dropdown.classList.add('open');
+    });
     this.input.addEventListener('input', () => this._renderDropdown());
-    document.addEventListener('click', e => {
-      if (!this.container.contains(e.target)) this.dropdown.classList.remove('open');
+    // mousedown fires before blur, so the dropdown stays open long enough for selection
+    this.dropdown.addEventListener('mousedown', e => e.preventDefault());
+    this.input.addEventListener('blur', () => {
+      setTimeout(() => this.dropdown.classList.remove('open'), 150);
     });
   }
 
@@ -272,7 +277,12 @@ class DevPicker {
     const filtered = this.allDevs.filter(d =>
       (d.author_name || '').toLowerCase().includes(q) ||
       (d.author_email || '').toLowerCase().includes(q)
-    ).slice(0, 30);
+    ).slice(0, 50);
+
+    if (!filtered.length) {
+      this.dropdown.innerHTML = '<div class="empty" style="padding:12px">Никого не найдено</div>';
+      return;
+    }
 
     this.dropdown.innerHTML = filtered.map(d => `
       <div class="dev-option ${this.selected.includes(d.author_email) ? 'selected' : ''}"
@@ -282,11 +292,16 @@ class DevPicker {
           <div class="dev-name">${d.author_name || d.author_email}</div>
           <div class="dev-email">${d.author_email}</div>
         </div>
+        ${this.selected.includes(d.author_email) ? '<svg style="margin-left:auto;flex-shrink:0" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#3fb950" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' : ''}
       </div>
     `).join('');
 
     this.dropdown.querySelectorAll('.dev-option').forEach(el => {
-      el.addEventListener('click', () => this._toggle(el.dataset.email, el.dataset.name));
+      el.addEventListener('mousedown', e => {
+        e.preventDefault();
+        this._toggle(el.dataset.email, el.dataset.name);
+        this.input.focus();
+      });
     });
   }
 
