@@ -43,7 +43,14 @@
 <div class="grid-2">
   <!-- Top contributors -->
   <div class="panel">
-    <div class="panel-header"><span class="panel-title">Топ разработчиков</span></div>
+    <div class="panel-header">
+      <span class="panel-title">Топ разработчиков</span>
+      <div class="chart-toggle">
+        <button class="btn-toggle active" data-metric="commit_count">Коммиты</button>
+        <button class="btn-toggle" data-metric="total_changes">Изменения</button>
+        <button class="btn-toggle" data-metric="active_days">Активных дней</button>
+      </div>
+    </div>
     <div class="panel-body">
       <div class="chart-wrap" style="height:260px">
         <canvas id="chart-top"></canvas>
@@ -77,43 +84,47 @@
 {% block scripts %}
 <script>
 let chartTop = null;
+let _topContributors = [];
+let _topMetric = 'commit_count';
+
+const _metricCfg = {
+  commit_count:   { label: 'Коммиты',        color: '#1f6feb' },
+  total_changes:  { label: 'Изменений файлов', color: '#3fb950' },
+  active_days:    { label: 'Активных дней',   color: '#d29922' },
+};
+
+function renderTopChart() {
+  const topEl = document.getElementById('chart-top');
+  if (chartTop) chartTop.destroy();
+  if (!_topContributors.length) { empty(topEl.parentElement, 'Нет данных'); return; }
+  const cfg = _metricCfg[_topMetric];
+  const sorted = [..._topContributors].sort((a,b) => (b[_topMetric]||0) - (a[_topMetric]||0)).slice(0,10);
+  chartTop = makeBarChart(
+    topEl,
+    sorted.map(d => d.author_name || d.author_email),
+    [{ label: cfg.label, data: sorted.map(d => d[_topMetric]||0), backgroundColor: cfg.color, borderRadius: 4 }],
+    { horizontal: true, legend: false }
+  );
+}
 
 async function loadOverview() {
   try {
     const data = await api('/api/overview');
-    // Cards
-    document.getElementById('c-commits').textContent = fmt(data.total_commits);
-    document.getElementById('c-devs').textContent = fmt(data.active_devs);
-    document.getElementById('c-repos').textContent = fmt(data.total_repos);
-    document.getElementById('c-prs').textContent = fmt(data.total_prs);
 
-    // Heatmap
+    document.getElementById('c-commits').textContent = fmt(data.total_commits);
+    document.getElementById('c-devs').textContent    = fmt(data.active_devs);
+    document.getElementById('c-repos').textContent   = fmt(data.total_repos);
+    document.getElementById('c-prs').textContent     = fmt(data.total_prs);
+
     const weeks = State.fromDate
       ? Math.ceil((new Date(State.toDate) - new Date(State.fromDate)) / (7*86400000)) + 1
       : 26;
     document.getElementById('heatmap-weeks-label').textContent = `последние ${Math.min(weeks,52)} недели`;
     buildHeatmap(document.getElementById('team-heatmap'), data.team_heatmap, Math.min(weeks, 52));
 
-    // Top chart
-    const topEl = document.getElementById('chart-top');
-    if (chartTop) chartTop.destroy();
-    if (data.top_contributors.length) {
-      chartTop = makeBarChart(
-        topEl,
-        data.top_contributors.map(d => d.author_name || d.author_email),
-        [{
-          label: 'Коммиты',
-          data: data.top_contributors.map(d => d.commit_count),
-          backgroundColor: '#1f6feb',
-          borderRadius: 4,
-        }],
-        { horizontal: true, legend: false }
-      );
-    } else {
-      empty(topEl.parentElement, 'Нет данных');
-    }
+    _topContributors = data.top_contributors || [];
+    renderTopChart();
 
-    // Recent feed
     const feed = document.getElementById('recent-feed');
     if (data.recent_commits.length) {
       feed.innerHTML = data.recent_commits.map(c => `
@@ -138,7 +149,6 @@ async function loadOverview() {
       empty(feed, 'Нет коммитов');
     }
 
-    // Developer table
     loadDevs();
   } catch(e) {
     document.getElementById('team-heatmap').innerHTML = `<div class="alert alert-error">${e.message}</div>`;
@@ -186,6 +196,15 @@ async function loadDevs() {
     document.getElementById('dev-table').innerHTML = `<div class="alert alert-error">${e.message}</div>`;
   }
 }
+
+document.querySelectorAll('.btn-toggle[data-metric]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.btn-toggle[data-metric]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    _topMetric = btn.dataset.metric;
+    renderTopChart();
+  });
+});
 
 onDateChange(loadOverview);
 document.addEventListener('DOMContentLoaded', loadOverview);

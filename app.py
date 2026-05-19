@@ -74,11 +74,6 @@ def developer(email: str):
     return render_template("developer.html", email=email)
 
 
-@app.route("/compare")
-def compare():
-    return render_template("compare.html")
-
-
 @app.route("/repos")
 def repos():
     return render_template("repos.html")

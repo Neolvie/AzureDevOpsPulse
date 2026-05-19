@@ -240,7 +240,7 @@ def sync_repository(
                 repo_id=repo_id,
                 project_id=project_id,
                 title=pr.get("title", "")[:300],
-                creator_email=creator.get("uniqueName", "") or creator.get("mailAddress", ""),
+                creator_email=creator.get("mailAddress", "") or creator.get("uniqueName", ""),
                 creator_name=creator.get("displayName", ""),
                 status=pr.get("status", ""),
                 created_date=_parse_date(pr.get("creationDate", "")),

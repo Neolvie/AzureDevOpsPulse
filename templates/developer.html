@@ -59,7 +59,14 @@
 
   <!-- Commit size -->
   <div class="panel">
-    <div class="panel-header"><span class="panel-title">Размер коммитов</span></div>
+    <div class="panel-header">
+      <span class="panel-title">Изменения файлов</span>
+      <div class="chart-toggle">
+        <button class="btn-toggle active" data-gran2="day">День</button>
+        <button class="btn-toggle" data-gran2="week">Неделя</button>
+        <button class="btn-toggle" data-gran2="month">Месяц</button>
+      </div>
+    </div>
     <div class="panel-body"><div class="chart-wrap"><canvas id="chart-size" height="180"></canvas></div></div>
   </div>
 </div>
@@ -87,6 +94,7 @@ const EMAIL = '{{ email }}';
 let dailyData = [];
 let chartFreq = null, chartSize = null, chartPrs = null, chartRepos = null;
 let granularity = 'day';
+let granularity2 = 'day';
 
 function aggregateByGranularity(daily, gran) {
   if (gran === 'day') return daily;
@@ -108,6 +116,21 @@ function aggregateByGranularity(daily, gran) {
     map[key].deletes += r.deletes || 0;
   });
   return Object.values(map).sort((a,b) => a.day.localeCompare(b.day));
+}
+
+function renderSizeChart(gran) {
+  const agg = aggregateByGranularity(dailyData, gran);
+  if (chartSize) chartSize.destroy();
+  chartSize = makeBarChart(
+    document.getElementById('chart-size'),
+    agg.map(r => fmtDate(r.day)),
+    [
+      { label: 'Добавлено', data: agg.map(r=>r.adds||0),    backgroundColor:'rgba(63,185,80,.7)',  borderRadius:2 },
+      { label: 'Изменено',  data: agg.map(r=>r.edits||0),   backgroundColor:'rgba(31,111,235,.7)', borderRadius:2 },
+      { label: 'Удалено',   data: agg.map(r=>r.deletes||0), backgroundColor:'rgba(248,81,73,.7)',  borderRadius:2 },
+    ],
+    { stacked: true }
+  );
 }
 
 function renderFreqChart(gran) {
@@ -157,18 +180,7 @@ async function loadDeveloper() {
     dailyData = data.daily || [];
     renderFreqChart(granularity);
 
-    // Size chart
-    if (chartSize) chartSize.destroy();
-    chartSize = makeBarChart(
-      document.getElementById('chart-size'),
-      dailyData.map(r => fmtDate(r.day)),
-      [
-        { label: 'Добавлено', data: dailyData.map(r=>r.adds||0), backgroundColor:'rgba(63,185,80,.7)', borderRadius:2 },
-        { label: 'Изменено',  data: dailyData.map(r=>r.edits||0), backgroundColor:'rgba(31,111,235,.7)', borderRadius:2 },
-        { label: 'Удалено',   data: dailyData.map(r=>r.deletes||0), backgroundColor:'rgba(248,81,73,.7)', borderRadius:2 },
-      ],
-      { stacked: true }
-    );
+    renderSizeChart(granularity2);
 
     // PR doughnut
     if (chartPrs) chartPrs.destroy();
@@ -195,13 +207,21 @@ async function loadDeveloper() {
   }
 }
 
-// Granularity toggle
 document.querySelectorAll('.btn-toggle[data-granularity]').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.btn-toggle[data-granularity]').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     granularity = btn.dataset.granularity;
     renderFreqChart(granularity);
+  });
+});
+
+document.querySelectorAll('.btn-toggle[data-gran2]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.btn-toggle[data-gran2]').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    granularity2 = btn.dataset.gran2;
+    renderSizeChart(granularity2);
   });
 });
 
