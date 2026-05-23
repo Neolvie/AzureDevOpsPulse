@@ -91,10 +91,7 @@
 <div class="panel">
   <div class="panel-header">
     <span class="panel-title">Текстовый отчёт</span>
-    <div style="display:flex;gap:8px">
-      <button class="btn btn-secondary" style="padding:4px 10px;font-size:.8rem" onclick="generateReport()">Сгенерировать</button>
-      <button class="btn btn-primary"   style="padding:4px 10px;font-size:.8rem" id="btn-copy-report" onclick="copyReport()" disabled>Скопировать</button>
-    </div>
+    <button class="btn btn-primary" style="padding:4px 10px;font-size:.8rem" id="btn-copy-report" onclick="copyReport()">Скопировать</button>
   </div>
   <div class="panel-body">
     <div style="font-size:.82rem;color:var(--text-muted);margin-bottom:10px">
@@ -104,7 +101,7 @@
       style="width:100%;min-height:320px;background:var(--surface2);border:1px solid var(--border);
              border-radius:var(--radius-sm);color:var(--text);font-family:monospace;font-size:.82rem;
              padding:12px;resize:vertical;outline:none;line-height:1.6"
-      placeholder="Нажмите «Сгенерировать» для создания отчёта..."></textarea>
+      placeholder="Загрузка отчёта..."></textarea>
   </div>
 </div>
 {% endblock %}
@@ -225,6 +222,7 @@ async function loadDeveloper() {
       [{ label:'Коммиты', data: repos.map(r=>r.commit_count), backgroundColor:'#1f6feb', borderRadius:3 }],
       { horizontal: true, legend: false }
     );
+    generateReport();
   } catch(e) {
     document.getElementById('dev-heatmap').innerHTML = `<div class="alert alert-error">${e.message}</div>`;
   }
@@ -287,15 +285,6 @@ function generateReport() {
     ? (commits / (periodDays * 5/7)).toFixed(2)
     : '—';
 
-  const prMap = { completed: 0, active: 0, abandoned: 0 };
-  (_devData.pr_stats || []).forEach(r => { if (r.status in prMap) prMap[r.status] = r.count; });
-  const prTotal = prMap.completed + prMap.active + prMap.abandoned;
-  const mergeRate = prTotal > 0 ? Math.round(prMap.completed / prTotal * 100) : 0;
-
-  const repoLines = repos.slice(0, 7).map((r, i) =>
-    `  ${i+1}. ${r.repo_name}: ${r.commit_count} ком., ${r.total_changes} изм.`
-  ).join('\n');
-
   const aliasLine = aliases.length
     ? `\nДополнительные учётные записи: ${aliases.join(', ')}`
     : '';
@@ -324,23 +313,10 @@ function generateReport() {
     `  • Изменение : ${totalEdit.toLocaleString('ru-RU')}${pct(totalEdit, totalChg)}`,
     `  • Удаление  : ${totalDel.toLocaleString('ru-RU')}${pct(totalDel, totalChg)}`,
     ``,
-    `─── PULL REQUESTS ──────────────────────`,
-    prTotal > 0
-      ? [`Создано PR: ${prTotal}`,
-         `  • Завершено : ${prMap.completed}`,
-         `  • Активных  : ${prMap.active}`,
-         `  • Отклонено : ${prMap.abandoned}`,
-         `Merge rate  : ${mergeRate}%`].join('\n')
-      : `Данные по PR отсутствуют (требуется пересинхронизация)`,
-    ``,
-    `─── ТОП РЕПОЗИТОРИЕВ ───────────────────`,
-    repoLines || '  нет данных',
-    ``,
     `════════════════════════════════════════`,
   ].join('\n');
 
   document.getElementById('report-text').value = lines;
-  document.getElementById('btn-copy-report').disabled = false;
 }
 
 function copyReport() {
