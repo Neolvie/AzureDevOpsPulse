@@ -187,22 +187,24 @@ async function loadOverview() {
 }
 
 // ── Composite score ───────────────────────────────────────────────────────────
-// Weights: commits 35%, weighted-changes 30%, active-days 25%, creation-ratio 10%
+// Weights: active-days 35%, weighted-changes 30%, commits 20%, intensity 15%
 // Changes are weighted: additions×1.0, edits×0.7, deletions×0.5
+// Intensity = weighted-changes per active day (rewards productive work days)
 // All components normalized relative to the best performer in the visible set.
 function computeScores(devs) {
   const wc = d => (d.total_add||0)*1.0 + (d.total_edit||0)*0.7 + (d.total_delete||0)*0.5;
-  const maxCommits = Math.max(...devs.map(d => d.commit_count||0), 1);
-  const maxDays    = Math.max(...devs.map(d => d.active_days||0),  1);
-  const maxWC      = Math.max(...devs.map(wc), 1);
+  const maxCommits   = Math.max(...devs.map(d => d.commit_count||0), 1);
+  const maxDays      = Math.max(...devs.map(d => d.active_days||0),  1);
+  const maxWC        = Math.max(...devs.map(wc), 1);
+  const intensity    = d => (d.active_days||0) > 0 ? wc(d) / d.active_days : 0;
+  const maxIntensity = Math.max(...devs.map(intensity), 1);
 
   return devs.map(d => {
-    const commitScore    = (d.commit_count||0)  / maxCommits * 100;
-    const activityScore  = (d.active_days||0)   / maxDays    * 100;
-    const changeScore    = wc(d)                / maxWC      * 100;
-    const total          = d.total_changes || 0;
-    const creationScore  = total > 0 ? (d.total_add||0) / total * 100 : 50;
-    const score = Math.round(commitScore*0.35 + changeScore*0.30 + activityScore*0.25 + creationScore*0.10);
+    const activityScore  = (d.active_days||0)   / maxDays      * 100;
+    const changeScore    = wc(d)                / maxWC        * 100;
+    const commitScore    = (d.commit_count||0)  / maxCommits   * 100;
+    const intensityScore = intensity(d)         / maxIntensity * 100;
+    const score = Math.round(activityScore*0.35 + changeScore*0.30 + commitScore*0.20 + intensityScore*0.15);
     return { ...d, score };
   });
 }
@@ -252,7 +254,7 @@ function renderDevTable() {
     <table>
       <thead><tr>
         <th>Разработчик</th>
-        <th style="${thStyle}" onclick="sortTable('score')" title="Коммиты 35% + изменения 30% + активность 25% + создание файлов 10%">Рейтинг${_sortIndicator('score')}</th>
+        <th style="${thStyle}" onclick="sortTable('score')" title="Активность 35% + изменения 30% + коммиты 20% + интенсивность 15%">Рейтинг${_sortIndicator('score')}</th>
         <th style="${thStyle}" onclick="sortTable('commit_count')">Коммиты${_sortIndicator('commit_count')}</th>
         <th style="${thStyle}" onclick="sortTable('active_days')">Активных дней${_sortIndicator('active_days')}</th>
         <th style="${thStyle}" onclick="sortTable('total_add')">Добавлено${_sortIndicator('total_add')}</th>
