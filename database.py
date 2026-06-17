@@ -75,12 +75,22 @@ CREATE TABLE IF NOT EXISTS employee_aliases (
     UNIQUE(alias_email)
 );
 
+CREATE TABLE IF NOT EXISTS pr_reviews (
+    pr_id          INTEGER NOT NULL,
+    reviewer_email TEXT NOT NULL,
+    reviewer_name  TEXT,
+    vote           INTEGER DEFAULT 0,
+    PRIMARY KEY (pr_id, reviewer_email)
+);
+
 CREATE INDEX IF NOT EXISTS idx_commits_author_date  ON commits(author_email, author_date);
 CREATE INDEX IF NOT EXISTS idx_commits_repo_date    ON commits(repo_id, author_date);
 CREATE INDEX IF NOT EXISTS idx_commits_date         ON commits(author_date);
 CREATE INDEX IF NOT EXISTS idx_pr_creator_date      ON pull_requests(creator_email, created_date);
 CREATE INDEX IF NOT EXISTS idx_pr_repo              ON pull_requests(repo_id);
 CREATE INDEX IF NOT EXISTS idx_aliases_primary      ON employee_aliases(primary_email);
+CREATE INDEX IF NOT EXISTS idx_pr_reviews_email     ON pr_reviews(reviewer_email);
+CREATE INDEX IF NOT EXISTS idx_pr_reviews_pr        ON pr_reviews(pr_id);
 """
 
 # CTE that resolves each commit's author_email to its canonical (primary) email.
@@ -94,11 +104,46 @@ _ALIAS_CTE = (
     ") "
 )
 
-# Inline expression to resolve PR creator email to canonical email.
+# Condition matching canonical_email (outer) against PR creator_email.
+# Handles full email, alias, or bare NT login stored without domain.
+_PR_CREATOR_MATCH = (
+    "(canonical_email = LOWER(creator_email)"
+    " OR canonical_email LIKE LOWER(creator_email) || '@%'"
+    " OR canonical_email = (SELECT primary_email FROM employee_aliases"
+    "   WHERE alias_email = creator_email)"
+    " OR canonical_email = (SELECT primary_email FROM employee_aliases"
+    "   WHERE alias_email = (SELECT author_email FROM commits"
+    "     WHERE LOWER(author_email) LIKE LOWER(creator_email) || '@%' LIMIT 1)))"
+)
+
+# Condition matching canonical_email (outer) against pr_reviews.reviewer_email.
+_PR_REVIEWER_MATCH = (
+    "(canonical_email = LOWER(rv.reviewer_email)"
+    " OR canonical_email LIKE rv.reviewer_email || '@%'"
+    " OR canonical_email = (SELECT primary_email FROM employee_aliases"
+    "   WHERE alias_email = rv.reviewer_email)"
+    " OR canonical_email = (SELECT primary_email FROM employee_aliases"
+    "   WHERE alias_email = (SELECT author_email FROM commits"
+    "     WHERE LOWER(author_email) LIKE rv.reviewer_email || '@%' LIMIT 1)))"
+)
+
+# Legacy scalar expression — used in get_developer_stats where email is a literal value.
 _PR_CANONICAL = (
     "LOWER(COALESCE("
     "  (SELECT primary_email FROM employee_aliases WHERE alias_email = creator_email),"
+    "  (SELECT author_email FROM commits"
+    "   WHERE LOWER(author_email) LIKE LOWER(creator_email) || '@%' LIMIT 1),"
     "  creator_email"
+    "))"
+)
+
+# Legacy scalar expression for reviewer email resolution (literal context).
+_ALIAS_REVIEW_EMAIL = (
+    "LOWER(COALESCE("
+    "  (SELECT primary_email FROM employee_aliases WHERE alias_email = rv.reviewer_email),"
+    "  (SELECT author_email FROM commits"
+    "   WHERE LOWER(author_email) LIKE rv.reviewer_email || '@%' LIMIT 1),"
+    "  rv.reviewer_email"
     "))"
 )
 
@@ -132,6 +177,7 @@ class Database:
         with self._conn() as conn:
             conn.executescript("""
                 DELETE FROM commits;
+                DELETE FROM pr_reviews;
                 DELETE FROM pull_requests;
                 DELETE FROM sync_log;
                 DELETE FROM repositories;
@@ -307,6 +353,17 @@ class Database:
                 ),
             )
 
+    def upsert_pr_review(self, pr_id: int, reviewer_email: str, reviewer_name: str, vote: int):
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO pr_reviews(pr_id, reviewer_email, reviewer_name, vote)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(pr_id, reviewer_email) DO UPDATE SET
+                       vote=excluded.vote,
+                       reviewer_name=excluded.reviewer_name""",
+                (pr_id, (reviewer_email or "").lower(), reviewer_name, vote),
+            )
+
     def log_sync(self, repo_id: str, sync_type: str, count: int, error: str = None):
         ts = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
@@ -327,6 +384,26 @@ class Database:
             row = conn.execute(sql, params).fetchone()
         return row[0] if row and row[0] is not None else default
 
+    @staticmethod
+    def _qc(conn, sql: str, params=()) -> list[dict]:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    @staticmethod
+    def _sc(conn, sql: str, params=(), default=0):
+        row = conn.execute(sql, params).fetchone()
+        return row[0] if row and row[0] is not None else default
+
+    @staticmethod
+    def _pr_logins(emails: list[str]) -> list[str]:
+        """Expand canonical emails to include bare NT logins for PR/review table matching."""
+        result = []
+        for e in emails:
+            result.append(e)
+            login = e.split('@')[0] if '@' in e else e
+            if login != e:
+                result.append(login)
+        return result
+
     def get_all_authors(self) -> list[dict]:
         return self._q(
             f"""{_ALIAS_CTE}
@@ -342,141 +419,233 @@ class Database:
         emp_sql, emp_params = self._emp_clause(employees)
         base = f"AND author_date BETWEEN ? AND ? AND is_merge=0{emp_sql}"
         params = [from_date, to_date, *emp_params]
-        pr_emp_sql = ""
-        if employees:
-            ph = ",".join("?" * len(employees))
-            pr_emp_sql = f" AND {_PR_CANONICAL} IN ({ph})"
-        return {
-            "total_commits": self._scalar(
-                f"{_ALIAS_CTE}SELECT COUNT(*) FROM cc WHERE 1=1 {base}", params
-            ),
-            "active_devs": self._scalar(
-                f"{_ALIAS_CTE}SELECT COUNT(DISTINCT canonical_email) FROM cc WHERE 1=1 {base}", params
-            ),
-            "total_repos": self._scalar("SELECT COUNT(*) FROM repositories"),
-            "total_prs": self._scalar(
-                f"SELECT COUNT(*) FROM pull_requests WHERE created_date BETWEEN ? AND ?{pr_emp_sql}",
-                [from_date, to_date, *emp_params],
-            ),
-            "top_contributors": self._q(
-                f"""{_ALIAS_CTE}SELECT
-                       COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
-                                MAX(author_name)) AS author_name,
-                       canonical_email AS author_email,
-                       COUNT(*) AS commit_count,
-                       SUM(changes_add+changes_edit+changes_delete) AS total_changes,
-                       SUM(changes_add) AS total_add,
-                       SUM(changes_edit) AS total_edit,
-                       SUM(changes_delete) AS total_delete,
-                       COUNT(DISTINCT DATE(author_date)) AS active_days
-                    FROM cc WHERE 1=1 {base}
-                    GROUP BY canonical_email ORDER BY commit_count DESC LIMIT 10""",
-                params,
-            ),
-            "team_heatmap": self._q(
-                f"""{_ALIAS_CTE}SELECT DATE(author_date) AS day, COUNT(*) AS count
-                    FROM cc WHERE 1=1 {base}
-                    GROUP BY day ORDER BY day""",
-                params,
-            ),
-            "recent_commits": self._q(
-                f"""{_ALIAS_CTE}SELECT cc.id, cc.author_name, cc.author_email, cc.author_date,
-                          cc.comment, cc.changes_add, cc.changes_edit, cc.changes_delete,
-                          r.name AS repo_name
-                   FROM cc LEFT JOIN repositories r ON cc.repo_id=r.id
-                   WHERE cc.is_merge=0{emp_sql}
-                   ORDER BY cc.author_date DESC LIMIT 20""",
-                emp_params,
-            ),
-        }
+        # PR employee filter: match both canonical email and bare NT login
+        pr_logins = self._pr_logins(employees) if employees else []
+        if pr_logins:
+            ph = ",".join("?" * len(pr_logins))
+            pr_emp_sql = f" AND LOWER(creator_email) IN ({ph})"
+        else:
+            pr_emp_sql = ""
+        with self._conn() as conn:
+            return {
+                "total_commits": self._sc(
+                    conn, f"{_ALIAS_CTE}SELECT COUNT(*) FROM cc WHERE 1=1 {base}", params
+                ),
+                "active_devs": self._sc(
+                    conn,
+                    f"{_ALIAS_CTE}SELECT COUNT(DISTINCT canonical_email) FROM cc WHERE 1=1 {base}",
+                    params,
+                ),
+                "total_repos": self._sc(conn, "SELECT COUNT(*) FROM repositories"),
+                "total_prs": self._sc(
+                    conn,
+                    f"SELECT COUNT(*) FROM pull_requests WHERE created_date BETWEEN ? AND ?{pr_emp_sql}",
+                    [from_date, to_date, *pr_logins],
+                ),
+                "top_contributors": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT
+                           COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
+                                    MAX(author_name)) AS author_name,
+                           canonical_email AS author_email,
+                           COUNT(*) AS commit_count,
+                           SUM(changes_add+changes_edit+changes_delete) AS total_changes,
+                           SUM(changes_add) AS total_add,
+                           SUM(changes_edit) AS total_edit,
+                           SUM(changes_delete) AS total_delete,
+                           COUNT(DISTINCT DATE(author_date)) AS active_days
+                        FROM cc WHERE 1=1 {base}
+                        GROUP BY canonical_email ORDER BY commit_count DESC LIMIT 10""",
+                    params,
+                ),
+                "team_heatmap": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT DATE(author_date) AS day, COUNT(*) AS count
+                        FROM cc WHERE 1=1 {base}
+                        GROUP BY day ORDER BY day""",
+                    params,
+                ),
+                "recent_commits": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT cc.id, cc.author_name, cc.author_email, cc.author_date,
+                              cc.comment, cc.changes_add, cc.changes_edit, cc.changes_delete,
+                              r.name AS repo_name
+                       FROM cc LEFT JOIN repositories r ON cc.repo_id=r.id
+                       WHERE cc.is_merge=0{emp_sql}
+                       ORDER BY cc.author_date DESC LIMIT 20""",
+                    emp_params,
+                ),
+            }
 
     def get_developers(self, from_date: str, to_date: str, employees: list[str] = None) -> list[dict]:
         emp_sql, emp_params = self._emp_clause(employees)
+        # login_map строится один раз: логин (часть email до @) → canonical_email.
+        # pr_agg и rv_agg используют его для резолва NT-логинов без LIKE на каждую строку.
         return self._q(
-            f"""{_ALIAS_CTE}SELECT canonical_email AS author_email,
-                      COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
-                               MAX(author_name)) AS author_name,
+            f"""WITH login_map AS (
+                  SELECT
+                    LOWER(CASE WHEN INSTR(c.author_email,'@')>0
+                               THEN SUBSTR(c.author_email,1,INSTR(c.author_email,'@')-1)
+                               ELSE c.author_email END) AS login,
+                    LOWER(COALESCE(ea.primary_email, c.author_email)) AS canonical_email
+                  FROM commits c
+                  LEFT JOIN employee_aliases ea ON c.author_email = ea.alias_email
+                  WHERE c.author_email != ''
+                  GROUP BY login
+                ),
+                cc AS (
+                  SELECT c.*,
+                    LOWER(COALESCE(ea.primary_email, c.author_email)) AS canonical_email
+                  FROM commits c
+                  LEFT JOIN employee_aliases ea ON c.author_email = ea.alias_email
+                ),
+                pr_agg AS (
+                  SELECT
+                    COALESCE(
+                      (SELECT ea.primary_email FROM employee_aliases ea
+                       WHERE ea.alias_email = p.creator_email),
+                      (SELECT lm.canonical_email FROM login_map lm
+                       WHERE lm.login = LOWER(p.creator_email)),
+                      LOWER(p.creator_email)
+                    ) AS dev_email,
+                    COUNT(*) AS pr_count
+                  FROM pull_requests p
+                  WHERE p.created_date BETWEEN ? AND ?
+                  GROUP BY dev_email
+                ),
+                rv_agg AS (
+                  SELECT
+                    COALESCE(
+                      (SELECT ea.primary_email FROM employee_aliases ea
+                       WHERE ea.alias_email = rv.reviewer_email),
+                      (SELECT lm.canonical_email FROM login_map lm
+                       WHERE lm.login = LOWER(rv.reviewer_email)),
+                      LOWER(rv.reviewer_email)
+                    ) AS dev_email,
+                    COUNT(*) AS review_count,
+                    SUM(CASE WHEN rv.vote =  10 THEN 1 ELSE 0 END) AS review_approved,
+                    SUM(CASE WHEN rv.vote = -10 THEN 1 ELSE 0 END) AS review_rejected
+                  FROM pr_reviews rv
+                  JOIN pull_requests pr ON pr.id = rv.pr_id
+                  WHERE pr.created_date BETWEEN ? AND ?
+                  GROUP BY dev_email
+                )
+                SELECT cc.canonical_email AS author_email,
+                      COALESCE(MAX(CASE WHEN cc.author_email=cc.canonical_email THEN cc.author_name END),
+                               MAX(cc.author_name)) AS author_name,
                       COUNT(*) AS commit_count,
-                      COUNT(DISTINCT DATE(author_date)) AS active_days,
-                      SUM(changes_add+changes_edit+changes_delete) AS total_changes,
-                      SUM(changes_add) AS total_add,
-                      SUM(changes_edit) AS total_edit,
-                      SUM(changes_delete) AS total_delete,
-                      MAX(author_date) AS last_commit
+                      COUNT(DISTINCT DATE(cc.author_date)) AS active_days,
+                      SUM(cc.changes_add+cc.changes_edit+cc.changes_delete) AS total_changes,
+                      SUM(cc.changes_add) AS total_add,
+                      SUM(cc.changes_edit) AS total_edit,
+                      SUM(cc.changes_delete) AS total_delete,
+                      MAX(cc.author_date) AS last_commit,
+                      COALESCE(MAX(pr_agg.pr_count), 0) AS pr_count,
+                      COALESCE(MAX(rv_agg.review_count), 0) AS review_count,
+                      COALESCE(MAX(rv_agg.review_approved), 0) AS review_approved,
+                      COALESCE(MAX(rv_agg.review_rejected), 0) AS review_rejected
                FROM cc
-               WHERE author_date BETWEEN ? AND ? AND is_merge=0{emp_sql}
-               GROUP BY canonical_email
+               LEFT JOIN pr_agg ON pr_agg.dev_email = cc.canonical_email
+               LEFT JOIN rv_agg ON rv_agg.dev_email = cc.canonical_email
+               WHERE cc.author_date BETWEEN ? AND ? AND cc.is_merge=0{emp_sql}
+               GROUP BY cc.canonical_email
                ORDER BY commit_count DESC""",
-            [from_date, to_date, *emp_params],
+            [from_date, to_date,   # pr_agg
+             from_date, to_date,   # rv_agg
+             from_date, to_date,   # main WHERE
+             *emp_params],
         )
 
     def get_developer_stats(self, email: str, from_date: str, to_date: str) -> dict:
         email = email.lower()
+        # Bare NT login is the part before '@'; PRs/reviews may store either form.
+        login = email.split('@')[0] if '@' in email else email
+        pr_ids = (email, login, from_date, to_date)
         p = (email, from_date, to_date)
-        return {
-            "summary": self._q(
-                f"""{_ALIAS_CTE}SELECT COUNT(*) AS commit_count,
-                          COUNT(DISTINCT DATE(author_date)) AS active_days,
-                          SUM(changes_add) AS total_add,
-                          SUM(changes_edit) AS total_edit,
-                          SUM(changes_delete) AS total_delete,
-                          AVG(changes_add+changes_edit+changes_delete) AS avg_changes,
-                          MAX(author_date) AS last_commit
-                   FROM cc
-                   WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0""",
-                p,
-            ),
-            "heatmap": self._q(
-                f"""{_ALIAS_CTE}SELECT DATE(author_date) AS day, COUNT(*) AS count
-                   FROM cc
-                   WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0
-                   GROUP BY day ORDER BY day""",
-                p,
-            ),
-            "daily": self._q(
-                f"""{_ALIAS_CTE}SELECT DATE(author_date) AS day,
-                          COUNT(*) AS commits,
-                          SUM(changes_add) AS adds,
-                          SUM(changes_edit) AS edits,
-                          SUM(changes_delete) AS deletes
-                   FROM cc
-                   WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0
-                   GROUP BY day ORDER BY day""",
-                p,
-            ),
-            "pr_stats": self._q(
-                f"""SELECT status, COUNT(*) AS count
-                   FROM pull_requests
-                   WHERE {_PR_CANONICAL}=? AND created_date BETWEEN ? AND ?
-                   GROUP BY status""",
-                p,
-            ),
-            "repos": self._q(
-                f"""{_ALIAS_CTE}SELECT r.name AS repo_name, r.id AS repo_id,
-                          COUNT(*) AS commit_count,
-                          SUM(cc.changes_add+cc.changes_edit+cc.changes_delete) AS total_changes
-                   FROM cc LEFT JOIN repositories r ON cc.repo_id=r.id
-                   WHERE cc.canonical_email=? AND cc.author_date BETWEEN ? AND ? AND cc.is_merge=0
-                   GROUP BY cc.repo_id ORDER BY commit_count DESC""",
-                p,
-            ),
-            "info": self._q(
-                f"""{_ALIAS_CTE}SELECT canonical_email AS author_email,
-                       COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
-                                MAX(author_name)) AS author_name
-                   FROM cc WHERE canonical_email=?""",
-                (email,),
-            ),
-            "active_weeks": self._scalar(
-                f"""{_ALIAS_CTE}SELECT COUNT(DISTINCT strftime('%Y-%W', author_date))
-                   FROM cc WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0""",
-                (email, from_date, to_date),
-            ),
-            "aliases": self._q(
-                """SELECT alias_email FROM employee_aliases WHERE primary_email=?""",
-                (email,),
-            ),
-        }
+        with self._conn() as conn:
+            return {
+                "summary": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT COUNT(*) AS commit_count,
+                              COUNT(DISTINCT DATE(author_date)) AS active_days,
+                              SUM(changes_add) AS total_add,
+                              SUM(changes_edit) AS total_edit,
+                              SUM(changes_delete) AS total_delete,
+                              AVG(changes_add+changes_edit+changes_delete) AS avg_changes,
+                              MAX(author_date) AS last_commit
+                       FROM cc
+                       WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0""",
+                    p,
+                ),
+                "heatmap": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT DATE(author_date) AS day, COUNT(*) AS count
+                       FROM cc
+                       WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0
+                       GROUP BY day ORDER BY day""",
+                    p,
+                ),
+                "daily": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT DATE(author_date) AS day,
+                              COUNT(*) AS commits,
+                              SUM(changes_add) AS adds,
+                              SUM(changes_edit) AS edits,
+                              SUM(changes_delete) AS deletes
+                       FROM cc
+                       WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0
+                       GROUP BY day ORDER BY day""",
+                    p,
+                ),
+                "pr_stats": self._qc(
+                    conn,
+                    """SELECT status, COUNT(*) AS count
+                       FROM pull_requests
+                       WHERE LOWER(creator_email) IN (?,?) AND created_date BETWEEN ? AND ?
+                       GROUP BY status""",
+                    pr_ids,
+                ),
+                "repos": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT r.name AS repo_name, r.id AS repo_id,
+                              COUNT(*) AS commit_count,
+                              SUM(cc.changes_add+cc.changes_edit+cc.changes_delete) AS total_changes
+                       FROM cc LEFT JOIN repositories r ON cc.repo_id=r.id
+                       WHERE cc.canonical_email=? AND cc.author_date BETWEEN ? AND ? AND cc.is_merge=0
+                       GROUP BY cc.repo_id ORDER BY commit_count DESC""",
+                    p,
+                ),
+                "info": self._qc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT canonical_email AS author_email,
+                           COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
+                                    MAX(author_name)) AS author_name
+                       FROM cc WHERE canonical_email=?""",
+                    (email,),
+                ),
+                "active_weeks": self._sc(
+                    conn,
+                    f"""{_ALIAS_CTE}SELECT COUNT(DISTINCT strftime('%Y-%W', author_date))
+                       FROM cc WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0""",
+                    (email, from_date, to_date),
+                ),
+                "aliases": self._qc(
+                    conn,
+                    "SELECT alias_email FROM employee_aliases WHERE primary_email=?",
+                    (email,),
+                ),
+                "review_stats": self._qc(
+                    conn,
+                    """SELECT
+                           COUNT(*) AS reviews_total,
+                           SUM(CASE WHEN vote=10 THEN 1 ELSE 0 END) AS approved
+                       FROM pr_reviews rv
+                       JOIN pull_requests pr ON pr.id=rv.pr_id
+                       WHERE LOWER(rv.reviewer_email) IN (?,?)
+                         AND pr.created_date BETWEEN ? AND ?""",
+                    pr_ids,
+                ),
+            }
 
     def get_compare_stats(self, emails: list[str], from_date: str, to_date: str) -> list[dict]:
         placeholders = ",".join("?" * len(emails))
