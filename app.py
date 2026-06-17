@@ -44,6 +44,9 @@ def _dates():
 
 
 def _employee_filter() -> list[str]:
+    team_id = db.get_selected_team()
+    if team_id:
+        return db.get_team_members(team_id)
     return db.get_selected_employees()
 
 
@@ -138,6 +141,12 @@ def api_employees_all():
     return _ok(authors)
 
 
+@app.route("/api/all-emails")
+def api_all_emails():
+    """All unique emails: commit authors + PR creators + reviewers (for alias form)."""
+    return _ok(db.get_all_emails())
+
+
 @app.route("/api/employees/selected", methods=["GET", "POST"])
 def api_employees_selected():
     if request.method == "GET":
@@ -148,6 +157,85 @@ def api_employees_selected():
         return _err("emails должен быть массивом")
     db.save_selected_employees(emails)
     return _ok({"saved": len(emails)})
+
+
+@app.route("/api/teams", methods=["GET", "POST"])
+def api_teams():
+    if request.method == "GET":
+        return _ok(db.get_teams())
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return _err("Название команды не может быть пустым")
+    team_id = db.create_team(name)
+    if team_id is None:
+        return _err("Команда с таким названием уже существует")
+    return _ok({"id": team_id, "name": name, "members": []})
+
+
+@app.route("/api/teams/<int:team_id>", methods=["PUT", "DELETE"])
+def api_team(team_id: int):
+    if request.method == "DELETE":
+        db.delete_team(team_id)
+        return _ok({"deleted": team_id})
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return _err("Название не может быть пустым")
+    ok = db.rename_team(team_id, name)
+    if not ok:
+        return _err("Команда с таким названием уже существует")
+    return _ok({"id": team_id, "name": name})
+
+
+@app.route("/api/teams/<int:team_id>/members", methods=["POST", "DELETE"])
+def api_team_members(team_id: int):
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return _err("email не может быть пустым")
+    if request.method == "POST":
+        db.add_team_member(team_id, email)
+        return _ok({"added": email})
+    db.remove_team_member(team_id, email)
+    return _ok({"removed": email})
+
+
+@app.route("/api/teams/select", methods=["GET", "POST"])
+def api_teams_select():
+    if request.method == "GET":
+        team_id = db.get_selected_team()
+        team_name = None
+        if team_id:
+            teams = {t["id"]: t["name"] for t in db.get_teams()}
+            team_name = teams.get(team_id)
+        return _ok({"team_id": team_id, "team_name": team_name})
+    data = request.get_json(force=True) or {}
+    try:
+        team_id = int(data.get("team_id", 0))
+    except (TypeError, ValueError):
+        team_id = 0
+    db.save_selected_team(team_id)
+    return _ok({"team_id": team_id})
+
+
+@app.route("/api/display-names", methods=["GET", "POST"])
+def api_display_names():
+    if request.method == "GET":
+        return _ok(db.get_display_names())
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    display_name = (data.get("display_name") or "").strip()
+    if not email or not display_name:
+        return _err("email and display_name required")
+    db.set_display_name(email, display_name)
+    return _ok({"email": email, "display_name": display_name})
+
+
+@app.route("/api/display-names/<path:email>", methods=["DELETE"])
+def api_display_name_delete(email: str):
+    db.delete_display_name(email)
+    return _ok(None)
 
 
 @app.route("/api/overview")

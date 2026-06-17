@@ -19,6 +19,7 @@
     <button class="btn-quick" data-days="180">Полгода</button>
     <button class="btn-quick" data-days="365">Год</button>
   </div>
+  <div id="team-filter-wrap"></div>
 </div>
 
 <!-- Summary cards -->
@@ -332,6 +333,9 @@ document.querySelectorAll('.btn-toggle[data-chart-dir]').forEach(btn => {
 });
 
 onDateChange(loadOverview);
-document.addEventListener('DOMContentLoaded', loadOverview);
+document.addEventListener('DOMContentLoaded', async () => {
+  await initTeamFilter('team-filter-wrap', loadOverview);
+  loadOverview();
+});
 </script>
 {% endblock %}

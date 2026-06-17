@@ -19,6 +19,7 @@
     <button class="btn-quick" data-days="180">Полгода</button>
     <button class="btn-quick" data-days="365">Год</button>
   </div>
+  <div id="team-filter-wrap"></div>
 </div>
 
 <!-- Repos table -->
@@ -138,6 +139,9 @@ function closeDetail() {
 }
 
 onDateChange(loadRepos);
-document.addEventListener('DOMContentLoaded', loadRepos);
+document.addEventListener('DOMContentLoaded', async () => {
+  await initTeamFilter('team-filter-wrap', loadRepos);
+  loadRepos();
+});
 </script>
 {% endblock %}

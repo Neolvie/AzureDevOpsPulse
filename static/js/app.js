@@ -3,6 +3,7 @@ const State = {
   fromDate: null,
   toDate: null,
   onDateChange: [],
+  selectedTeamId: 0,
 };
 
 /* ── Utils ── */
@@ -349,6 +350,52 @@ function setActiveNav() {
       const href = el.dataset.href;
       if (href) location.href = href;
     });
+  });
+}
+
+/* ── Team filter ── */
+
+/**
+ * Renders a team dropdown inside `containerId` and wires it up.
+ * `onSelect` is called (with no args) after team selection is saved server-side.
+ */
+async function initTeamFilter(containerId, onSelect) {
+  const wrap = document.getElementById(containerId);
+  if (!wrap) return;
+
+  const [teamsJson, selJson] = await Promise.all([
+    fetch('/api/teams').then(r => r.json()),
+    fetch('/api/teams/select').then(r => r.json()),
+  ]);
+
+  const teams = teamsJson.data || [];
+  State.selectedTeamId = (selJson.data?.team_id) || 0;
+
+  if (!teams.length) {
+    wrap.style.display = 'none';
+    return;
+  }
+
+  wrap.innerHTML = `
+    <div style="display:flex;align-items:center;gap:6px">
+      <label style="font-size:.85rem;color:var(--text-muted);white-space:nowrap">Команда</label>
+      <select id="team-select-dropdown" style="height:34px;padding:0 8px;border:1px solid var(--border);
+              border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);
+              font-size:.85rem;cursor:pointer;min-width:140px">
+        <option value="0">Все команды</option>
+        ${teams.map(t => `<option value="${t.id}" ${t.id == State.selectedTeamId ? 'selected' : ''}>${t.name} (${t.members.length})</option>`).join('')}
+      </select>
+    </div>`;
+
+  document.getElementById('team-select-dropdown').addEventListener('change', async e => {
+    const teamId = parseInt(e.target.value) || 0;
+    State.selectedTeamId = teamId;
+    await fetch('/api/teams/select', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ team_id: teamId }),
+    });
+    onSelect();
   });
 }
 

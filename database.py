@@ -83,6 +83,22 @@ CREATE TABLE IF NOT EXISTS pr_reviews (
     PRIMARY KEY (pr_id, reviewer_email)
 );
 
+CREATE TABLE IF NOT EXISTS teams (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS team_members (
+    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    email   TEXT NOT NULL,
+    PRIMARY KEY (team_id, email)
+);
+
+CREATE TABLE IF NOT EXISTS author_display_names (
+    email        TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_commits_author_date  ON commits(author_email, author_date);
 CREATE INDEX IF NOT EXISTS idx_commits_repo_date    ON commits(repo_id, author_date);
 CREATE INDEX IF NOT EXISTS idx_commits_date         ON commits(author_date);
@@ -92,6 +108,36 @@ CREATE INDEX IF NOT EXISTS idx_aliases_primary      ON employee_aliases(primary_
 CREATE INDEX IF NOT EXISTS idx_pr_reviews_email     ON pr_reviews(reviewer_email);
 CREATE INDEX IF NOT EXISTS idx_pr_reviews_pr        ON pr_reviews(pr_id);
 """
+
+# Deterministic login → canonical_email map.
+# A person can commit under several emails sharing one NT login (e.g.
+# makarov_am@w1458w10 for real work plus a stray makarov_am@directum.ru merge).
+# A plain "GROUP BY login" would pick an arbitrary row (SQLite returns the
+# first-encountered one), which could resolve the login to the wrong account and
+# make PR/review aggregates miss the developer entirely. Here we deterministically
+# choose, per login, the canonical email with the most real (non-merge) commits —
+# i.e. the same identity shown in the dashboards.
+_LOGIN_MAP = """login_map AS (
+                  SELECT login, canonical_email FROM (
+                    SELECT
+                      LOWER(CASE WHEN INSTR(c.author_email,'@')>0
+                                 THEN SUBSTR(c.author_email,1,INSTR(c.author_email,'@')-1)
+                                 ELSE c.author_email END) AS login,
+                      LOWER(COALESCE(ea.primary_email, c.author_email)) AS canonical_email,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY LOWER(CASE WHEN INSTR(c.author_email,'@')>0
+                                                THEN SUBSTR(c.author_email,1,INSTR(c.author_email,'@')-1)
+                                                ELSE c.author_email END)
+                        ORDER BY SUM(CASE WHEN c.is_merge=0 THEN 1 ELSE 0 END) DESC,
+                                 COUNT(*) DESC,
+                                 LOWER(COALESCE(ea.primary_email, c.author_email))
+                      ) AS rn
+                    FROM commits c
+                    LEFT JOIN employee_aliases ea ON c.author_email = ea.alias_email
+                    WHERE c.author_email != ''
+                    GROUP BY login, canonical_email
+                  ) WHERE rn = 1
+                )"""
 
 # CTE that resolves each commit's author_email to its canonical (primary) email.
 # Use by prepending to any SELECT that groups/filters by author.
@@ -127,12 +173,19 @@ _PR_REVIEWER_MATCH = (
     "     WHERE LOWER(author_email) LIKE rv.reviewer_email || '@%' LIMIT 1)))"
 )
 
-# Legacy scalar expression — used in get_developer_stats where email is a literal value.
+# Scalar expression resolving a PR creator_email to its canonical commit email.
+# Matches by login prefix (part before '@') so a full TFS email whose domain
+# differs from the commit email still resolves to the same person.
 _PR_CANONICAL = (
     "LOWER(COALESCE("
     "  (SELECT primary_email FROM employee_aliases WHERE alias_email = creator_email),"
     "  (SELECT author_email FROM commits"
-    "   WHERE LOWER(author_email) LIKE LOWER(creator_email) || '@%' LIMIT 1),"
+    "   WHERE LOWER(CASE WHEN INSTR(author_email,'@')>0"
+    "                THEN SUBSTR(author_email,1,INSTR(author_email,'@')-1)"
+    "                ELSE author_email END)"
+    "       = LOWER(CASE WHEN INSTR(creator_email,'@')>0"
+    "                THEN SUBSTR(creator_email,1,INSTR(creator_email,'@')-1)"
+    "                ELSE creator_email END) LIMIT 1),"
     "  creator_email"
     "))"
 )
@@ -406,12 +459,53 @@ class Database:
 
     def get_all_authors(self) -> list[dict]:
         return self._q(
-            f"""{_ALIAS_CTE}
+            f"""WITH {_LOGIN_MAP},
+                tfs_names AS (
+                  SELECT COALESCE(
+                           (SELECT lm.canonical_email FROM login_map lm WHERE lm.login = LOWER(
+                              CASE WHEN INSTR(p.creator_email,'@')>0
+                                   THEN SUBSTR(p.creator_email,1,INSTR(p.creator_email,'@')-1)
+                                   ELSE p.creator_email END)),
+                           LOWER(p.creator_email)
+                         ) AS dev_email,
+                         MAX(p.creator_name) AS tfs_name
+                  FROM pull_requests p
+                  WHERE p.creator_name IS NOT NULL AND p.creator_name != ''
+                  GROUP BY dev_email
+                  UNION ALL
+                  SELECT COALESCE(
+                           (SELECT lm.canonical_email FROM login_map lm WHERE lm.login = LOWER(
+                              CASE WHEN INSTR(rv.reviewer_email,'@')>0
+                                   THEN SUBSTR(rv.reviewer_email,1,INSTR(rv.reviewer_email,'@')-1)
+                                   ELSE rv.reviewer_email END)),
+                           LOWER(rv.reviewer_email)
+                         ) AS dev_email,
+                         MAX(rv.reviewer_name) AS tfs_name
+                  FROM pr_reviews rv
+                  WHERE rv.reviewer_name IS NOT NULL AND rv.reviewer_name != ''
+                  GROUP BY dev_email
+                ),
+                best_names AS (
+                  SELECT dev_email, MAX(tfs_name) AS tfs_name FROM tfs_names GROUP BY dev_email
+                ),
+                cc AS (
+                  SELECT c.*,
+                    LOWER(COALESCE(ea.primary_email, c.author_email)) AS canonical_email
+                  FROM commits c
+                  LEFT JOIN employee_aliases ea ON c.author_email = ea.alias_email
+                )
             SELECT canonical_email AS author_email,
-                   COALESCE(MAX(CASE WHEN author_email = canonical_email THEN author_name END),
-                            MAX(author_name)) AS author_name,
+                   COALESCE(
+                     MAX(adn.display_name),
+                     MAX(bn.tfs_name),
+                     MAX(CASE WHEN author_email = canonical_email THEN author_name END),
+                     MAX(author_name)
+                   ) AS author_name,
                    COUNT(*) AS commit_count
-            FROM cc WHERE is_merge=0
+            FROM cc
+            LEFT JOIN best_names bn ON bn.dev_email = canonical_email
+            LEFT JOIN author_display_names adn ON adn.email = canonical_email
+            WHERE is_merge=0
             GROUP BY canonical_email ORDER BY author_name"""
         )
 
@@ -419,14 +513,82 @@ class Database:
         emp_sql, emp_params = self._emp_clause(employees)
         base = f"AND author_date BETWEEN ? AND ? AND is_merge=0{emp_sql}"
         params = [from_date, to_date, *emp_params]
-        # PR employee filter: match both canonical email and bare NT login
-        pr_logins = self._pr_logins(employees) if employees else []
+        # PR employee filter: match on the login prefix (part before '@') so a
+        # selected employee is found whether their PRs are stored as a bare NT
+        # login or as a full email whose domain differs from their commit email.
+        pr_logins = [(e.split('@')[0] if '@' in e else e).lower() for e in employees] if employees else []
         if pr_logins:
             ph = ",".join("?" * len(pr_logins))
-            pr_emp_sql = f" AND LOWER(creator_email) IN ({ph})"
+            pr_emp_sql = (
+                " AND LOWER(CASE WHEN INSTR(creator_email,'@')>0"
+                " THEN SUBSTR(creator_email,1,INSTR(creator_email,'@')-1)"
+                " ELSE creator_email END) IN (" + ph + ")"
+            )
         else:
             pr_emp_sql = ""
         with self._conn() as conn:
+            # Build login→TFS display name map once for name resolution
+            pr_name_rows = self._qc(
+                conn,
+                "SELECT LOWER(creator_email) AS login, MAX(creator_name) AS tfs_name"
+                " FROM pull_requests WHERE creator_name IS NOT NULL AND creator_name != ''"
+                " GROUP BY login",
+            )
+            rv_name_rows = self._qc(
+                conn,
+                "SELECT LOWER(reviewer_email) AS login, MAX(reviewer_name) AS tfs_name"
+                " FROM pr_reviews WHERE reviewer_name IS NOT NULL AND reviewer_name != ''"
+                " GROUP BY login",
+            )
+            name_map: dict[str, str] = {}
+            for r in rv_name_rows:
+                name_map[r["login"]] = r["tfs_name"]
+            for r in pr_name_rows:  # PR names take priority
+                name_map[r["login"]] = r["tfs_name"]
+
+            # display_names have highest priority (manual overrides)
+            dn_rows = self._qc(conn, "SELECT email, display_name FROM author_display_names")
+            display_names: dict[str, str] = {r["email"]: r["display_name"] for r in dn_rows}
+
+            def best_name(dev: dict) -> str:
+                email = dev.get("author_email", "")
+                login = email.split("@")[0] if "@" in email else email
+                return (display_names.get(email) or display_names.get(login)
+                        or name_map.get(login) or name_map.get(email)
+                        or dev.get("author_name") or email)
+
+            top_contributors = self._qc(
+                conn,
+                f"""{_ALIAS_CTE}SELECT
+                       COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
+                                MAX(author_name)) AS author_name,
+                       canonical_email AS author_email,
+                       COUNT(*) AS commit_count,
+                       SUM(changes_add+changes_edit+changes_delete) AS total_changes,
+                       SUM(changes_add) AS total_add,
+                       SUM(changes_edit) AS total_edit,
+                       SUM(changes_delete) AS total_delete,
+                       COUNT(DISTINCT DATE(author_date)) AS active_days
+                    FROM cc WHERE 1=1 {base}
+                    GROUP BY canonical_email ORDER BY commit_count DESC LIMIT 10""",
+                params,
+            )
+            for dev in top_contributors:
+                dev["author_name"] = best_name(dev)
+
+            recent_commits = self._qc(
+                conn,
+                f"""{_ALIAS_CTE}SELECT cc.id, cc.author_name, cc.author_email, cc.author_date,
+                          cc.comment, cc.changes_add, cc.changes_edit, cc.changes_delete,
+                          r.name AS repo_name
+                   FROM cc LEFT JOIN repositories r ON cc.repo_id=r.id
+                   WHERE cc.is_merge=0{emp_sql}
+                   ORDER BY cc.author_date DESC LIMIT 20""",
+                emp_params,
+            )
+            for c in recent_commits:
+                c["author_name"] = best_name(c)
+
             return {
                 "total_commits": self._sc(
                     conn, f"{_ALIAS_CTE}SELECT COUNT(*) FROM cc WHERE 1=1 {base}", params
@@ -442,22 +604,7 @@ class Database:
                     f"SELECT COUNT(*) FROM pull_requests WHERE created_date BETWEEN ? AND ?{pr_emp_sql}",
                     [from_date, to_date, *pr_logins],
                 ),
-                "top_contributors": self._qc(
-                    conn,
-                    f"""{_ALIAS_CTE}SELECT
-                           COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
-                                    MAX(author_name)) AS author_name,
-                           canonical_email AS author_email,
-                           COUNT(*) AS commit_count,
-                           SUM(changes_add+changes_edit+changes_delete) AS total_changes,
-                           SUM(changes_add) AS total_add,
-                           SUM(changes_edit) AS total_edit,
-                           SUM(changes_delete) AS total_delete,
-                           COUNT(DISTINCT DATE(author_date)) AS active_days
-                        FROM cc WHERE 1=1 {base}
-                        GROUP BY canonical_email ORDER BY commit_count DESC LIMIT 10""",
-                    params,
-                ),
+                "top_contributors": top_contributors,
                 "team_heatmap": self._qc(
                     conn,
                     f"""{_ALIAS_CTE}SELECT DATE(author_date) AS day, COUNT(*) AS count
@@ -465,16 +612,7 @@ class Database:
                         GROUP BY day ORDER BY day""",
                     params,
                 ),
-                "recent_commits": self._qc(
-                    conn,
-                    f"""{_ALIAS_CTE}SELECT cc.id, cc.author_name, cc.author_email, cc.author_date,
-                              cc.comment, cc.changes_add, cc.changes_edit, cc.changes_delete,
-                              r.name AS repo_name
-                       FROM cc LEFT JOIN repositories r ON cc.repo_id=r.id
-                       WHERE cc.is_merge=0{emp_sql}
-                       ORDER BY cc.author_date DESC LIMIT 20""",
-                    emp_params,
-                ),
+                "recent_commits": recent_commits,
             }
 
     def get_developers(self, from_date: str, to_date: str, employees: list[str] = None) -> list[dict]:
@@ -482,17 +620,7 @@ class Database:
         # login_map строится один раз: логин (часть email до @) → canonical_email.
         # pr_agg и rv_agg используют его для резолва NT-логинов без LIKE на каждую строку.
         return self._q(
-            f"""WITH login_map AS (
-                  SELECT
-                    LOWER(CASE WHEN INSTR(c.author_email,'@')>0
-                               THEN SUBSTR(c.author_email,1,INSTR(c.author_email,'@')-1)
-                               ELSE c.author_email END) AS login,
-                    LOWER(COALESCE(ea.primary_email, c.author_email)) AS canonical_email
-                  FROM commits c
-                  LEFT JOIN employee_aliases ea ON c.author_email = ea.alias_email
-                  WHERE c.author_email != ''
-                  GROUP BY login
-                ),
+            f"""WITH {_LOGIN_MAP},
                 cc AS (
                   SELECT c.*,
                     LOWER(COALESCE(ea.primary_email, c.author_email)) AS canonical_email
@@ -505,12 +633,17 @@ class Database:
                       (SELECT ea.primary_email FROM employee_aliases ea
                        WHERE ea.alias_email = p.creator_email),
                       (SELECT lm.canonical_email FROM login_map lm
-                       WHERE lm.login = LOWER(p.creator_email)),
+                       WHERE lm.login = LOWER(
+                         CASE WHEN INSTR(p.creator_email,'@')>0
+                              THEN SUBSTR(p.creator_email,1,INSTR(p.creator_email,'@')-1)
+                              ELSE p.creator_email END)),
                       LOWER(p.creator_email)
                     ) AS dev_email,
-                    COUNT(*) AS pr_count
+                    COUNT(*) AS pr_count,
+                    MAX(p.creator_name) AS tfs_name
                   FROM pull_requests p
                   WHERE p.created_date BETWEEN ? AND ?
+                    AND p.creator_name IS NOT NULL AND p.creator_name != ''
                   GROUP BY dev_email
                 ),
                 rv_agg AS (
@@ -519,20 +652,30 @@ class Database:
                       (SELECT ea.primary_email FROM employee_aliases ea
                        WHERE ea.alias_email = rv.reviewer_email),
                       (SELECT lm.canonical_email FROM login_map lm
-                       WHERE lm.login = LOWER(rv.reviewer_email)),
+                       WHERE lm.login = LOWER(
+                         CASE WHEN INSTR(rv.reviewer_email,'@')>0
+                              THEN SUBSTR(rv.reviewer_email,1,INSTR(rv.reviewer_email,'@')-1)
+                              ELSE rv.reviewer_email END)),
                       LOWER(rv.reviewer_email)
                     ) AS dev_email,
                     COUNT(*) AS review_count,
                     SUM(CASE WHEN rv.vote =  10 THEN 1 ELSE 0 END) AS review_approved,
-                    SUM(CASE WHEN rv.vote = -10 THEN 1 ELSE 0 END) AS review_rejected
+                    SUM(CASE WHEN rv.vote = -10 THEN 1 ELSE 0 END) AS review_rejected,
+                    MAX(rv.reviewer_name) AS tfs_name
                   FROM pr_reviews rv
                   JOIN pull_requests pr ON pr.id = rv.pr_id
                   WHERE pr.created_date BETWEEN ? AND ?
+                    AND rv.reviewer_name IS NOT NULL AND rv.reviewer_name != ''
                   GROUP BY dev_email
                 )
                 SELECT cc.canonical_email AS author_email,
-                      COALESCE(MAX(CASE WHEN cc.author_email=cc.canonical_email THEN cc.author_name END),
-                               MAX(cc.author_name)) AS author_name,
+                      COALESCE(
+                        MAX(adn.display_name),
+                        MAX(pr_agg.tfs_name),
+                        MAX(rv_agg.tfs_name),
+                        MAX(CASE WHEN cc.author_email=cc.canonical_email THEN cc.author_name END),
+                        MAX(cc.author_name)
+                      ) AS author_name,
                       COUNT(*) AS commit_count,
                       COUNT(DISTINCT DATE(cc.author_date)) AS active_days,
                       SUM(cc.changes_add+cc.changes_edit+cc.changes_delete) AS total_changes,
@@ -547,6 +690,7 @@ class Database:
                FROM cc
                LEFT JOIN pr_agg ON pr_agg.dev_email = cc.canonical_email
                LEFT JOIN rv_agg ON rv_agg.dev_email = cc.canonical_email
+               LEFT JOIN author_display_names adn ON adn.email = cc.canonical_email
                WHERE cc.author_date BETWEEN ? AND ? AND cc.is_merge=0{emp_sql}
                GROUP BY cc.canonical_email
                ORDER BY commit_count DESC""",
@@ -558,10 +702,15 @@ class Database:
 
     def get_developer_stats(self, email: str, from_date: str, to_date: str) -> dict:
         email = email.lower()
-        # Bare NT login is the part before '@'; PRs/reviews may store either form.
+        # Bare NT login is the part before '@'; PRs/reviews may store the bare
+        # login OR a full email whose domain differs from the commit email
+        # (e.g. commits as makarov_am@w1458w10 but PRs as makarov_am@directum.ru).
+        # Match on the login prefix so all such forms resolve to the same person.
         login = email.split('@')[0] if '@' in email else email
         pr_ids = (email, login, from_date, to_date)
         p = (email, from_date, to_date)
+        # (login, from, to) — used by PR/review queries that match on login prefix
+        login_pr = (login, from_date, to_date)
         with self._conn() as conn:
             return {
                 "summary": self._qc(
@@ -601,9 +750,12 @@ class Database:
                     conn,
                     """SELECT status, COUNT(*) AS count
                        FROM pull_requests
-                       WHERE LOWER(creator_email) IN (?,?) AND created_date BETWEEN ? AND ?
+                       WHERE LOWER(CASE WHEN INSTR(creator_email,'@')>0
+                                        THEN SUBSTR(creator_email,1,INSTR(creator_email,'@')-1)
+                                        ELSE creator_email END) = ?
+                         AND created_date BETWEEN ? AND ?
                        GROUP BY status""",
-                    pr_ids,
+                    login_pr,
                 ),
                 "repos": self._qc(
                     conn,
@@ -618,10 +770,26 @@ class Database:
                 "info": self._qc(
                     conn,
                     f"""{_ALIAS_CTE}SELECT canonical_email AS author_email,
-                           COALESCE(MAX(CASE WHEN author_email=canonical_email THEN author_name END),
-                                    MAX(author_name)) AS author_name
+                           COALESCE(
+                             (SELECT display_name FROM author_display_names
+                              WHERE email = canonical_email LIMIT 1),
+                             (SELECT p.creator_name FROM pull_requests p
+                              WHERE LOWER(CASE WHEN INSTR(p.creator_email,'@')>0
+                                               THEN SUBSTR(p.creator_email,1,INSTR(p.creator_email,'@')-1)
+                                               ELSE p.creator_email END) = ?
+                                AND p.creator_name IS NOT NULL AND p.creator_name != ''
+                              LIMIT 1),
+                             (SELECT rv.reviewer_name FROM pr_reviews rv
+                              WHERE LOWER(CASE WHEN INSTR(rv.reviewer_email,'@')>0
+                                               THEN SUBSTR(rv.reviewer_email,1,INSTR(rv.reviewer_email,'@')-1)
+                                               ELSE rv.reviewer_email END) = ?
+                                AND rv.reviewer_name IS NOT NULL AND rv.reviewer_name != ''
+                              LIMIT 1),
+                             MAX(CASE WHEN author_email=canonical_email THEN author_name END),
+                             MAX(author_name)
+                           ) AS author_name
                        FROM cc WHERE canonical_email=?""",
-                    (email,),
+                    (login, login, email),
                 ),
                 "active_weeks": self._sc(
                     conn,
@@ -641,9 +809,11 @@ class Database:
                            SUM(CASE WHEN vote=10 THEN 1 ELSE 0 END) AS approved
                        FROM pr_reviews rv
                        JOIN pull_requests pr ON pr.id=rv.pr_id
-                       WHERE LOWER(rv.reviewer_email) IN (?,?)
+                       WHERE LOWER(CASE WHEN INSTR(rv.reviewer_email,'@')>0
+                                        THEN SUBSTR(rv.reviewer_email,1,INSTR(rv.reviewer_email,'@')-1)
+                                        ELSE rv.reviewer_email END) = ?
                          AND pr.created_date BETWEEN ? AND ?""",
-                    pr_ids,
+                    login_pr,
                 ),
             }
 
@@ -792,6 +962,190 @@ class Database:
         with self._conn() as conn:
             conn.execute("DELETE FROM employee_aliases WHERE primary_email=?", (primary_email.lower(),))
         log.info("Alias group removed: primary=%s", primary_email)
+
+    # ── teams ────────────────────────────────────────────────────────────────────
+
+    def get_teams(self) -> list[dict]:
+        """Return all teams with member emails."""
+        teams = self._q("SELECT id, name FROM teams ORDER BY name")
+        members_all = self._q("SELECT team_id, email FROM team_members ORDER BY email")
+        by_team: dict[int, list[str]] = {}
+        for m in members_all:
+            by_team.setdefault(m["team_id"], []).append(m["email"])
+        for t in teams:
+            t["members"] = by_team.get(t["id"], [])
+        return teams
+
+    def create_team(self, name: str) -> int | None:
+        """Create team; return new id or None if name already exists."""
+        name = name.strip()
+        if not name:
+            return None
+        try:
+            with self._conn() as conn:
+                cur = conn.execute("INSERT INTO teams(name) VALUES(?)", (name,))
+                return cur.lastrowid
+        except Exception:
+            return None
+
+    def rename_team(self, team_id: int, name: str) -> bool:
+        name = name.strip()
+        if not name:
+            return False
+        try:
+            with self._conn() as conn:
+                conn.execute("UPDATE teams SET name=? WHERE id=?", (name, team_id))
+            return True
+        except Exception:
+            return False
+
+    def delete_team(self, team_id: int):
+        with self._conn() as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("DELETE FROM teams WHERE id=?", (team_id,))
+        # Clear selected team if it was this one
+        if self.get_selected_team() == team_id:
+            self.save_selected_team(0)
+
+    def add_team_member(self, team_id: int, email: str) -> bool:
+        email = email.lower().strip()
+        if not email:
+            return False
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO team_members(team_id, email) VALUES(?,?)",
+                    (team_id, email),
+                )
+            return True
+        except Exception:
+            return False
+
+    def remove_team_member(self, team_id: int, email: str):
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM team_members WHERE team_id=? AND email=?",
+                (team_id, email.lower()),
+            )
+
+    def get_team_members(self, team_id: int) -> list[str]:
+        rows = self._q(
+            "SELECT email FROM team_members WHERE team_id=? ORDER BY email", (team_id,)
+        )
+        return [r["email"] for r in rows]
+
+    def get_selected_team(self) -> int:
+        val = self._scalar(
+            "SELECT value FROM app_settings WHERE key='selected_team_id'", default=None
+        )
+        try:
+            return int(val) if val else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def save_selected_team(self, team_id: int):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO app_settings(key, value) VALUES('selected_team_id',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(team_id),),
+            )
+        log.info("Selected team: %s", team_id)
+
+    def get_all_emails(self) -> list[dict]:
+        """All unique canonical emails for alias/display-name forms.
+        Includes commit authors AND people who only appear in PRs or reviews.
+        Returns [{author_email, author_name, source}] sorted by name."""
+        return self._q(
+            f"""WITH {_LOGIN_MAP},
+                from_commits AS (
+                  SELECT LOWER(COALESCE(ea.primary_email, c.author_email)) AS email,
+                         COALESCE(MAX(adn.display_name),
+                                  MAX(CASE WHEN c.author_email=LOWER(COALESCE(ea.primary_email, c.author_email))
+                                           THEN c.author_name END),
+                                  MAX(c.author_name)) AS name,
+                         'commit' AS src
+                  FROM commits c
+                  LEFT JOIN employee_aliases ea ON c.author_email = ea.alias_email
+                  LEFT JOIN author_display_names adn
+                         ON adn.email = LOWER(COALESCE(ea.primary_email, c.author_email))
+                  WHERE c.author_email != ''
+                  -- group by the full expression, NOT the alias "email": the
+                  -- joined author_display_names.email column shadows the alias and
+                  -- would otherwise collapse every commit author into one NULL group.
+                  GROUP BY LOWER(COALESCE(ea.primary_email, c.author_email))
+                ),
+                from_prs AS (
+                  SELECT COALESCE(
+                           (SELECT lm.canonical_email FROM login_map lm WHERE lm.login=LOWER(
+                              CASE WHEN INSTR(p.creator_email,'@')>0
+                                   THEN SUBSTR(p.creator_email,1,INSTR(p.creator_email,'@')-1)
+                                   ELSE p.creator_email END)),
+                           LOWER(p.creator_email)
+                         ) AS email,
+                         MAX(p.creator_name) AS name,
+                         'pr' AS src
+                  FROM pull_requests p
+                  WHERE p.creator_email != '' AND p.creator_name IS NOT NULL AND p.creator_name != ''
+                  GROUP BY email
+                ),
+                from_reviews AS (
+                  SELECT COALESCE(
+                           (SELECT lm.canonical_email FROM login_map lm WHERE lm.login=LOWER(
+                              CASE WHEN INSTR(rv.reviewer_email,'@')>0
+                                   THEN SUBSTR(rv.reviewer_email,1,INSTR(rv.reviewer_email,'@')-1)
+                                   ELSE rv.reviewer_email END)),
+                           LOWER(rv.reviewer_email)
+                         ) AS email,
+                         MAX(rv.reviewer_name) AS name,
+                         'review' AS src
+                  FROM pr_reviews rv
+                  WHERE rv.reviewer_email != '' AND rv.reviewer_name IS NOT NULL AND rv.reviewer_name != ''
+                  GROUP BY email
+                ),
+                combined AS (
+                  SELECT email, name, src FROM from_commits
+                  UNION SELECT email, name, src FROM from_prs
+                  UNION SELECT email, name, src FROM from_reviews
+                )
+            SELECT email AS author_email,
+                   COALESCE(MAX(CASE WHEN src='pr' THEN name END),
+                            MAX(CASE WHEN src='review' THEN name END),
+                            MAX(name)) AS author_name,
+                   MAX(src) AS source
+            FROM combined
+            GROUP BY email
+            ORDER BY author_name"""
+        )
+
+    # ── display name overrides ───────────────────────────────────────────────────
+
+    def get_display_names(self) -> dict[str, str]:
+        """Return {email: display_name} for all manual overrides."""
+        rows = self._q("SELECT email, display_name FROM author_display_names ORDER BY email")
+        return {r["email"]: r["display_name"] for r in rows}
+
+    def set_display_name(self, email: str, display_name: str):
+        """Upsert a manual display name override for an email."""
+        email = email.lower().strip()
+        display_name = display_name.strip()
+        if not email or not display_name:
+            return
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO author_display_names(email, display_name) VALUES(?,?)"
+                " ON CONFLICT(email) DO UPDATE SET display_name=excluded.display_name",
+                (email, display_name),
+            )
+        log.info("Display name set: %s → %s", email, display_name)
+
+    def delete_display_name(self, email: str):
+        """Remove a manual display name override."""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM author_display_names WHERE email=?", (email.lower().strip(),)
+            )
+        log.info("Display name deleted: %s", email)
 
     def get_sync_log(self, limit: int = 50) -> list[dict]:
         return self._q(

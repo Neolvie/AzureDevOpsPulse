@@ -19,6 +19,7 @@
     <button class="btn-quick" data-days="180">Полгода</button>
     <button class="btn-quick" data-days="365">Год</button>
   </div>
+  <div id="team-filter-wrap"></div>
 </div>
 
 <!-- Developer picker -->
@@ -173,6 +174,10 @@ async function loadCompare(emails) {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  await initTeamFilter('team-filter-wrap', async () => {
+    await picker.load();
+    if (picker.selected.length) loadCompare(picker.selected);
+  });
   picker = new DevPicker(document.getElementById('dev-picker'), (emails) => loadCompare(emails));
   await picker.load();
 });
