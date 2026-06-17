@@ -19,6 +19,7 @@
     <button class="btn-quick" data-days="180">Полгода</button>
     <button class="btn-quick" data-days="365">Год</button>
   </div>
+  <div id="team-filter-wrap"></div>
 </div>
 
 <!-- Summary cards -->
@@ -257,6 +258,8 @@ function renderDevTable() {
         <th style="${thStyle}" onclick="sortTable('score')" title="Активность 35% + изменения 30% + коммиты 20% + интенсивность 15%">Рейтинг${_sortIndicator('score')}</th>
         <th style="${thStyle}" onclick="sortTable('commit_count')">Коммиты${_sortIndicator('commit_count')}</th>
         <th style="${thStyle}" onclick="sortTable('active_days')">Активных дней${_sortIndicator('active_days')}</th>
+        <th style="${thStyle}" onclick="sortTable('pr_count')">PR${_sortIndicator('pr_count')}</th>
+        <th style="${thStyle}" onclick="sortTable('review_count')" title="Кол-во PR, в которых разработчик был ревьюером">Ревью${_sortIndicator('review_count')}</th>
         <th style="${thStyle}" onclick="sortTable('total_add')">Добавлено${_sortIndicator('total_add')}</th>
         <th style="${thStyle}" onclick="sortTable('total_edit')">Изменено${_sortIndicator('total_edit')}</th>
         <th style="${thStyle}" onclick="sortTable('total_delete')">Удалено${_sortIndicator('total_delete')}</th>
@@ -286,6 +289,11 @@ function renderDevTable() {
             <div class="progress"><div class="progress-bar" style="width:${Math.round((d.commit_count||0)/maxC*100)}%"></div></div>
           </td>
           <td>${fmt(d.active_days)}</td>
+          <td>${fmt(d.pr_count||0)}</td>
+          <td title="Одобрено: ${d.review_approved||0} / Отклонено: ${d.review_rejected||0}">
+            ${fmt(d.review_count||0)}
+            ${d.review_count ? `<span style="color:var(--text-muted);font-size:.72rem"> ✓${d.review_approved||0} ✗${d.review_rejected||0}</span>` : ''}
+          </td>
           <td><span class="changes-add">+${fmt(d.total_add||0)}</span></td>
           <td><span style="color:#388bfd">${fmt(d.total_edit||0)}</span></td>
           <td><span class="changes-del">-${fmt(d.total_delete||0)}</span></td>
@@ -325,6 +333,9 @@ document.querySelectorAll('.btn-toggle[data-chart-dir]').forEach(btn => {
 });
 
 onDateChange(loadOverview);
-document.addEventListener('DOMContentLoaded', loadOverview);
+document.addEventListener('DOMContentLoaded', async () => {
+  await initTeamFilter('team-filter-wrap', loadOverview);
+  loadOverview();
+});
 </script>
 {% endblock %}

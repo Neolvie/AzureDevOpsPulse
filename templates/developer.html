@@ -87,6 +87,14 @@
   </div>
 </div>
 
+<!-- Code review -->
+<div class="panel">
+  <div class="panel-header"><span class="panel-title">Ревью Pull Requests</span></div>
+  <div class="panel-body" id="review-panel">
+    <div class="loading"><div class="spinner"></div></div>
+  </div>
+</div>
+
 <!-- Text report -->
 <div class="panel">
   <div class="panel-header">
@@ -222,11 +230,35 @@ async function loadDeveloper() {
       [{ label:'Коммиты', data: repos.map(r=>r.commit_count), backgroundColor:'#1f6feb', borderRadius:3 }],
       { horizontal: true, legend: false }
     );
+    renderReviewPanel(data.review_stats?.[0] || {});
     generateReport();
   } catch(e) {
     document.getElementById('dev-heatmap').innerHTML = `<div class="alert alert-error">${e.message}</div>`;
   }
 }
+
+function renderReviewPanel(rv) {
+  const panel = document.getElementById('review-panel');
+  const total    = rv.reviews_total || 0;
+  const approved = rv.approved || 0;
+  if (!total) {
+    panel.innerHTML = '<div class="empty" style="padding:20px">Нет данных о ревью за период</div>';
+    return;
+  }
+  const pct = total > 0 ? Math.round(approved / total * 100) : 0;
+  panel.innerHTML = `
+    <div style="display:flex;gap:32px;flex-wrap:wrap;align-items:center">
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <div style="font-size:2rem;font-weight:700">${fmt(total)}</div>
+        <div style="color:var(--text-muted);font-size:.85rem">PR проверено</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <div style="font-size:2rem;font-weight:700;color:#3fb950">${fmt(approved)}</div>
+        <div style="color:var(--text-muted);font-size:.85rem">Одобрено (${pct}%)</div>
+      </div>
+    </div>`;
+}
+
 
 document.querySelectorAll('.btn-toggle[data-granularity]').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -313,8 +345,21 @@ function generateReport() {
     `  • Изменение : ${totalEdit.toLocaleString('ru-RU')}${pct(totalEdit, totalChg)}`,
     `  • Удаление  : ${totalDel.toLocaleString('ru-RU')}${pct(totalDel, totalChg)}`,
     ``,
+    ...(() => {
+      const rv = _devData.review_stats?.[0] || {};
+      const total    = rv.reviews_total || 0;
+      if (!total) return [];
+      const approved = rv.approved || 0;
+      const pct = total > 0 ? ` (${Math.round(approved/total*100)}%)` : '';
+      return [
+        ``,
+        `─── РЕВЬЮ ──────────────────────────────`,
+        `Проверено PR    : ${total}`,
+        `  • Одобрено    : ${approved}${pct}`,
+      ];
+    })(),
     `════════════════════════════════════════`,
-  ].join('\n');
+  ].flat().join('\n');
 
   document.getElementById('report-text').value = lines;
 }

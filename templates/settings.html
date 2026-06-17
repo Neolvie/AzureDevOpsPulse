@@ -171,6 +171,82 @@
   </div>
 </div>
 
+<!-- Teams - full width -->
+<div class="panel" style="overflow:visible">
+  <div class="panel-header">
+    <span class="panel-title">Команды</span>
+    <button class="btn btn-secondary" style="padding:4px 10px;font-size:.8rem" onclick="showCreateTeamForm()">
+      + Новая команда
+    </button>
+  </div>
+  <div class="panel-body">
+    <div style="font-size:.85rem;color:var(--text-muted);margin-bottom:14px">
+      Объедините разработчиков в команды для быстрой фильтрации на всех страницах дашборда.
+    </div>
+
+    <!-- Create form -->
+    <div id="team-create-form" style="display:none;background:var(--surface2);border-radius:var(--radius-sm);padding:14px;margin-bottom:16px">
+      <div style="display:flex;gap:8px;align-items:flex-end">
+        <div style="flex:1">
+          <div class="form-label" style="font-size:.82rem;margin-bottom:4px">Название команды</div>
+          <input type="text" id="new-team-name" class="form-input" placeholder="например: Backend, Frontend, QA..."
+                 onkeydown="if(event.key==='Enter') saveNewTeam()">
+        </div>
+        <button class="btn btn-primary" onclick="saveNewTeam()">Создать</button>
+        <button class="btn btn-secondary" onclick="hideCreateTeamForm()">Отмена</button>
+      </div>
+      <div id="team-create-alert" style="display:none;margin-top:8px"></div>
+    </div>
+
+    <div id="teams-list">
+      <div class="loading"><div class="spinner"></div> Загрузка...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Display name overrides - full width -->
+<div class="panel" style="overflow:visible">
+  <div class="panel-header">
+    <span class="panel-title">Отображаемые имена</span>
+    <button class="btn btn-secondary" style="padding:4px 10px;font-size:.8rem" onclick="showDNForm()">
+      + Задать имя
+    </button>
+  </div>
+  <div class="panel-body">
+    <div style="font-size:.85rem;color:var(--text-muted);margin-bottom:14px">
+      Задайте имя вручную для разработчика, у которого нет PR/ревью — тогда TFS-имя недоступно автоматически.
+      Ручное имя имеет наивысший приоритет и заменяет любое другое.
+    </div>
+
+    <div id="dn-form" style="display:none;background:var(--surface2);border-radius:var(--radius-sm);padding:14px;margin-bottom:16px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+        <div>
+          <div class="form-label" style="font-size:.82rem;margin-bottom:4px">Разработчик</div>
+          <div style="position:relative">
+            <input type="text" id="dn-dev-input" class="form-input" placeholder="Поиск по имени или email..." autocomplete="off">
+            <div id="dn-dev-dd" class="dev-picker-dropdown" style="z-index:400"></div>
+          </div>
+          <input type="hidden" id="dn-dev-email">
+        </div>
+        <div>
+          <div class="form-label" style="font-size:.82rem;margin-bottom:4px">Имя для отображения</div>
+          <input type="text" id="dn-name-input" class="form-input" placeholder="Например: Макаров Андрей (Makarov_AM)"
+                 onkeydown="if(event.key==='Enter') saveDN()">
+        </div>
+      </div>
+      <div id="dn-form-alert" style="display:none;margin-bottom:8px"></div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-primary" onclick="saveDN()">Сохранить</button>
+        <button class="btn btn-secondary" onclick="hideDNForm()">Отмена</button>
+      </div>
+    </div>
+
+    <div id="dn-list">
+      <div class="loading"><div class="spinner"></div> Загрузка...</div>
+    </div>
+  </div>
+</div>
+
 <!-- Alias groups - full width -->
 <div class="panel" style="overflow:visible">
   <div class="panel-header">
@@ -385,9 +461,17 @@ function updateSyncUI(s) {
 async function loadSyncLog() {
   const wrap = document.getElementById('sync-log-table');
   try {
-    const resp = await fetch('/api/sync-log?limit=30');
-    const json = await resp.json();
-    const rows = json.data || [];
+    const [logResp, reposResp] = await Promise.all([
+      fetch('/api/sync-log?limit=30'),
+      fetch('/api/repositories')
+    ]);
+    const logJson = await logResp.json();
+    const reposJson = await reposResp.json();
+    const rows = logJson.data || [];
+    const repoMap = {};
+    for (const repo of (reposJson.data || [])) {
+      repoMap[repo.id] = repo.name;
+    }
     if (!rows.length) { wrap.innerHTML = '<div class="empty">Журнал пуст</div>'; return; }
     wrap.innerHTML = `
       <table>
@@ -401,7 +485,7 @@ async function loadSyncLog() {
         <tbody>${rows.map(r => `
           <tr>
             <td style="color:var(--text-muted);white-space:nowrap">${fmtDateTime(r.timestamp)}</td>
-            <td>${r.repo_id || '—'}</td>
+            <td>${repoMap[r.repo_id] || r.repo_id || '—'}</td>
             <td>${r.type === 'commits' ? 'Коммиты' : 'Pull Requests'}</td>
             <td>${fmt(r.count)}</td>
             <td>${r.error
@@ -620,6 +704,16 @@ async function saveProjects() {
 
 // ── Alias management ─────────────────────────────────────────────────────────
 let _aliasGroups = [];
+let _allEmails = [];  // extended list: commits + PR/review-only accounts
+
+async function _loadAllEmails() {
+  if (_allEmails.length) return;
+  try {
+    const resp = await fetch('/api/all-emails');
+    const json = await resp.json();
+    _allEmails = json.data || [];
+  } catch(_) {}
+}
 
 async function loadAliasGroups() {
   const list = document.getElementById('alias-groups-list');
@@ -691,25 +785,41 @@ function _buildAliasSearch(inputId, ddId, hiddenId) {
   const dd     = document.getElementById(ddId);
   const hidden = document.getElementById(hiddenId);
 
-  function render() {
+  async function render() {
+    await _loadAllEmails();
     const q = (input.value || '').toLowerCase();
-    const filtered = _allEmployees.filter(e =>
+    const source = _allEmails.length ? _allEmails : _allEmployees.map(e => ({
+      author_email: e.author_email, author_name: e.author_name
+    }));
+    const filtered = source.filter(e =>
       (e.author_name || '').toLowerCase().includes(q) ||
       (e.author_email || '').toLowerCase().includes(q)
     ).slice(0, 40);
+
     if (!filtered.length) {
-      dd.innerHTML = '<div class="empty" style="padding:10px">Не найдено</div>';
-      return;
+      // Allow free-text email input if nothing found in dropdown
+      dd.innerHTML = q.includes('@')
+        ? `<div class="dev-option" data-email="${q}" data-name="${q}">
+             <div class="avatar" style="background:${avatarColor(q)};width:22px;height:22px;font-size:.6rem;flex-shrink:0">${avatar(q)}</div>
+             <div><div class="dev-name">${q}</div><div class="dev-email" style="color:var(--text-muted);font-size:.75rem">Ввести вручную</div></div>
+           </div>`
+        : '<div class="empty" style="padding:10px">Не найдено</div>';
+    } else {
+      dd.innerHTML = filtered.map(e => {
+        const src = e.source === 'pr' ? ' <span style="font-size:.7rem;color:var(--text-muted)">(только PR)</span>'
+                  : e.source === 'review' ? ' <span style="font-size:.7rem;color:var(--text-muted)">(только ревью)</span>'
+                  : '';
+        return `
+          <div class="dev-option" data-email="${e.author_email}" data-name="${(e.author_name || e.author_email).replace(/"/g,'&quot;')}">
+            <div class="avatar" style="background:${avatarColor(e.author_email)};width:22px;height:22px;font-size:.6rem;flex-shrink:0">${avatar(e.author_name)}</div>
+            <div>
+              <div class="dev-name">${e.author_name || e.author_email}${src}</div>
+              <div class="dev-email">${e.author_email}</div>
+            </div>
+          </div>`;
+      }).join('');
     }
-    dd.innerHTML = filtered.map(e => `
-      <div class="dev-option" data-email="${e.author_email}" data-name="${(e.author_name || e.author_email).replace(/"/g,'&quot;')}">
-        <div class="avatar" style="background:${avatarColor(e.author_email)};width:22px;height:22px;font-size:.6rem;flex-shrink:0">${avatar(e.author_name)}</div>
-        <div>
-          <div class="dev-name">${e.author_name || e.author_email}</div>
-          <div class="dev-email">${e.author_email}</div>
-        </div>
-      </div>
-    `).join('');
+
     dd.querySelectorAll('.dev-option').forEach(el => {
       el.addEventListener('mousedown', ev => {
         ev.preventDefault();
@@ -723,17 +833,27 @@ function _buildAliasSearch(inputId, ddId, hiddenId) {
   input.addEventListener('focus', () => { render(); dd.classList.add('open'); });
   input.addEventListener('input', render);
   dd.addEventListener('mousedown', ev => ev.preventDefault());
-  input.addEventListener('blur', () => setTimeout(() => dd.classList.remove('open'), 150));
+  input.addEventListener('blur', () => {
+    setTimeout(() => {
+      dd.classList.remove('open');
+      // If user typed an email directly without picking from dropdown, accept it
+      if (!hidden.value && input.value.includes('@')) {
+        hidden.value = input.value.trim().toLowerCase();
+      }
+    }, 150);
+  });
 }
 
 async function saveNewAlias() {
-  const primary = document.getElementById('alias-primary-value').value.trim();
-  const alias   = document.getElementById('alias-secondary-value').value.trim();
+  const primary = (document.getElementById('alias-primary-value').value.trim()
+                || document.getElementById('alias-primary-input').value.trim()).toLowerCase();
+  const alias   = (document.getElementById('alias-secondary-value').value.trim()
+                || document.getElementById('alias-secondary-input').value.trim()).toLowerCase();
   const alertEl = document.getElementById('alias-form-alert');
 
   if (!primary || !alias) {
     alertEl.className = 'alert alert-error';
-    alertEl.textContent = 'Выберите оба аккаунта из выпадающего списка';
+    alertEl.textContent = 'Выберите или введите оба email-адреса';
     alertEl.style.display = 'block';
     return;
   }
@@ -771,14 +891,315 @@ async function removeAliasGroup(primaryEmail) {
   loadAliasGroups();
 }
 
+// ── Teams ──────────────────────────────────────────────────────────────────────
+
+let _allDevEmails = [];  // [{author_email, author_name}] for member search
+
+async function loadTeams() {
+  const [teamsResp, devsResp] = await Promise.all([
+    fetch('/api/teams').then(r => r.json()),
+    fetch('/api/employees/all').then(r => r.json()),
+  ]);
+  const teams = teamsResp.data || [];
+  _allDevEmails = (devsResp.data || []).map(d => ({ email: d.author_email, name: d.author_name || d.author_email }));
+
+  const wrap = document.getElementById('teams-list');
+  if (!teams.length) {
+    wrap.innerHTML = '<div class="empty">Нет команд. Создайте первую.</div>';
+    return;
+  }
+  wrap.innerHTML = teams.map(t => renderTeamCard(t)).join('');
+}
+
+function renderTeamCard(t) {
+  const memberRows = (t.members || []).map(email => {
+    const dev = _allDevEmails.find(d => d.email === email);
+    const name = dev ? dev.name : email;
+    return `
+      <div class="activity-item" style="padding:6px 12px;gap:10px" data-email="${email}">
+        <div class="avatar" style="background:${avatarColor(email)};width:26px;height:26px;font-size:.7rem;flex-shrink:0">${avatar(name)}</div>
+        <div style="flex:1;min-width:0">
+          <div class="dev-name" style="font-size:.85rem">${name}</div>
+          <div class="dev-email" style="font-size:.75rem">${email}</div>
+        </div>
+        <button class="btn btn-secondary" style="padding:2px 8px;font-size:.75rem;flex-shrink:0"
+                onclick="removeTeamMember(${t.id},'${email}')">✕</button>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="panel" style="margin-bottom:12px;border:1px solid var(--border)" id="team-card-${t.id}">
+      <div class="panel-header" style="padding:10px 16px">
+        <div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">
+          <span id="team-name-${t.id}" style="font-weight:600">${t.name}</span>
+          <span style="color:var(--text-muted);font-size:.8rem">${t.members.length} чел.</span>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-secondary" style="padding:3px 10px;font-size:.78rem"
+                  onclick="startRenameTeam(${t.id})">Переименовать</button>
+          <button class="btn btn-danger" style="padding:3px 10px;font-size:.78rem"
+                  onclick="deleteTeam(${t.id},'${t.name}')">Удалить</button>
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--border)">
+        ${memberRows || '<div style="padding:10px 16px;font-size:.82rem;color:var(--text-muted)">Участников нет</div>'}
+        <!-- add member row -->
+        <div style="padding:8px 12px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:center">
+          <div style="flex:1;position:relative">
+            <input type="text" class="form-input" id="add-member-input-${t.id}"
+                   placeholder="Поиск по имени или email..."
+                   style="font-size:.82rem;padding:5px 10px"
+                   oninput="showMemberSuggest(${t.id})"
+                   onkeydown="if(event.key==='Escape') hideMemberSuggest(${t.id})">
+            <div id="member-suggest-${t.id}" class="dev-picker-dropdown" style="top:100%;z-index:300"></div>
+          </div>
+          <button class="btn btn-primary" style="padding:5px 12px;font-size:.82rem;flex-shrink:0"
+                  onclick="addMemberFromInput(${t.id})">+ Добавить</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function showMemberSuggest(teamId) {
+  const input = document.getElementById(`add-member-input-${teamId}`);
+  const dd = document.getElementById(`member-suggest-${teamId}`);
+  const q = (input.value || '').toLowerCase();
+  const matches = _allDevEmails.filter(d =>
+    d.name.toLowerCase().includes(q) || d.email.toLowerCase().includes(q)
+  ).slice(0, 10);
+  if (!matches.length) { dd.classList.remove('open'); return; }
+  dd.innerHTML = matches.map(d => `
+    <div class="dev-option" data-email="${d.email}"
+         onmousedown="pickMember(${teamId},'${d.email}','${d.name.replace(/'/g,"\\'")}')">
+      <div class="avatar" style="background:${avatarColor(d.email)};width:24px;height:24px;font-size:.7rem">${avatar(d.name)}</div>
+      <div><div class="dev-name" style="font-size:.82rem">${d.name}</div><div class="dev-email" style="font-size:.73rem">${d.email}</div></div>
+    </div>`).join('');
+  dd.classList.add('open');
+}
+
+function hideMemberSuggest(teamId) {
+  const dd = document.getElementById(`member-suggest-${teamId}`);
+  if (dd) { dd.classList.remove('open'); dd.innerHTML = ''; }
+}
+
+function pickMember(teamId, email, name) {
+  const input = document.getElementById(`add-member-input-${teamId}`);
+  input.value = name;
+  input.dataset.pickedEmail = email;
+  hideMemberSuggest(teamId);
+}
+
+async function addMemberFromInput(teamId) {
+  const input = document.getElementById(`add-member-input-${teamId}`);
+  const email = input.dataset.pickedEmail || input.value.trim().toLowerCase();
+  if (!email) return;
+  await fetch(`/api/teams/${teamId}/members`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ email }),
+  });
+  input.value = '';
+  delete input.dataset.pickedEmail;
+  loadTeams();
+}
+
+async function removeTeamMember(teamId, email) {
+  await fetch(`/api/teams/${teamId}/members`, {
+    method: 'DELETE',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ email }),
+  });
+  loadTeams();
+}
+
+async function deleteTeam(teamId, name) {
+  if (!confirm(`Удалить команду «${name}»?`)) return;
+  await fetch(`/api/teams/${teamId}`, { method: 'DELETE' });
+  loadTeams();
+}
+
+function startRenameTeam(teamId) {
+  const nameEl = document.getElementById(`team-name-${teamId}`);
+  const oldName = nameEl.textContent;
+  nameEl.innerHTML = `
+    <input type="text" class="form-input" id="rename-input-${teamId}" value="${oldName}"
+           style="font-size:.9rem;padding:3px 8px;width:200px"
+           onkeydown="if(event.key==='Enter') saveRenameTeam(${teamId}); if(event.key==='Escape') loadTeams()">
+    <button class="btn btn-primary" style="padding:3px 10px;font-size:.78rem;margin-left:6px"
+            onclick="saveRenameTeam(${teamId})">ОК</button>
+    <button class="btn btn-secondary" style="padding:3px 8px;font-size:.78rem;margin-left:4px"
+            onclick="loadTeams()">✕</button>`;
+  document.getElementById(`rename-input-${teamId}`).focus();
+}
+
+async function saveRenameTeam(teamId) {
+  const newName = document.getElementById(`rename-input-${teamId}`)?.value?.trim();
+  if (!newName) return;
+  const resp = await fetch(`/api/teams/${teamId}`, {
+    method: 'PUT',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ name: newName }),
+  });
+  const json = await resp.json();
+  if (!json.success) { alert(json.error); return; }
+  loadTeams();
+}
+
+function showCreateTeamForm() {
+  document.getElementById('team-create-form').style.display = 'block';
+  document.getElementById('new-team-name').focus();
+}
+
+function hideCreateTeamForm() {
+  document.getElementById('team-create-form').style.display = 'none';
+  document.getElementById('new-team-name').value = '';
+  document.getElementById('team-create-alert').style.display = 'none';
+}
+
+async function saveNewTeam() {
+  const name = document.getElementById('new-team-name').value.trim();
+  if (!name) return;
+  const resp = await fetch('/api/teams', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ name }),
+  });
+  const json = await resp.json();
+  if (!json.success) {
+    const al = document.getElementById('team-create-alert');
+    al.className = 'alert alert-error'; al.textContent = json.error; al.style.display = 'block';
+    return;
+  }
+  hideCreateTeamForm();
+  loadTeams();
+}
+
+// ── Display name overrides ──────────────────────────────────────────────────
+
+async function loadDNList() {
+  const wrap = document.getElementById('dn-list');
+  try {
+    const resp = await fetch('/api/display-names');
+    const json = await resp.json();
+    const dn = json.data || {};
+    const entries = Object.entries(dn);
+    if (!entries.length) {
+      wrap.innerHTML = '<div class="empty">Нет ручных переопределений имён.</div>';
+      return;
+    }
+    wrap.innerHTML = entries.map(([email, name]) => `
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid rgba(48,54,61,.4)">
+        <div class="avatar" style="background:${avatarColor(email)};width:26px;height:26px;font-size:.65rem;flex-shrink:0">${avatar(name)}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:.875rem;font-weight:600">${name}</div>
+          <div style="font-size:.75rem;color:var(--text-muted)">${email}</div>
+        </div>
+        <button class="btn btn-secondary"
+                style="padding:3px 10px;font-size:.75rem;color:#f85149;border-color:rgba(248,81,73,.4);flex-shrink:0"
+                onclick="deleteDN(${JSON.stringify(email)})">Удалить</button>
+      </div>`).join('');
+  } catch(e) {
+    wrap.innerHTML = `<div class="alert alert-error" style="margin:0">${e.message}</div>`;
+  }
+}
+
+function showDNForm() {
+  document.getElementById('dn-form').style.display = 'block';
+  document.getElementById('dn-dev-input').value = '';
+  document.getElementById('dn-dev-email').value = '';
+  document.getElementById('dn-name-input').value = '';
+  document.getElementById('dn-form-alert').style.display = 'none';
+}
+
+function hideDNForm() {
+  document.getElementById('dn-form').style.display = 'none';
+}
+
+function _buildDNSearch() {
+  const input  = document.getElementById('dn-dev-input');
+  const dd     = document.getElementById('dn-dev-dd');
+  const hidden = document.getElementById('dn-dev-email');
+  const nameIn = document.getElementById('dn-name-input');
+
+  function render() {
+    const q = (input.value || '').toLowerCase();
+    const filtered = _allEmployees.filter(e =>
+      (e.author_name || '').toLowerCase().includes(q) ||
+      (e.author_email || '').toLowerCase().includes(q)
+    ).slice(0, 40);
+    if (!filtered.length) { dd.innerHTML = '<div class="empty" style="padding:10px">Не найдено</div>'; return; }
+    dd.innerHTML = filtered.map(e => `
+      <div class="dev-option" data-email="${e.author_email}"
+           data-name="${(e.author_name || e.author_email).replace(/"/g,'&quot;')}">
+        <div class="avatar" style="background:${avatarColor(e.author_email)};width:22px;height:22px;font-size:.6rem;flex-shrink:0">${avatar(e.author_name)}</div>
+        <div>
+          <div class="dev-name">${e.author_name || e.author_email}</div>
+          <div class="dev-email">${e.author_email}</div>
+        </div>
+      </div>`).join('');
+    dd.querySelectorAll('.dev-option').forEach(el => {
+      el.addEventListener('mousedown', ev => {
+        ev.preventDefault();
+        input.value  = el.dataset.name;
+        hidden.value = el.dataset.email;
+        // Pre-fill name field with current name so user can edit it
+        if (!nameIn.value) nameIn.value = el.dataset.name;
+        dd.classList.remove('open');
+        nameIn.focus();
+      });
+    });
+  }
+
+  input.addEventListener('focus', () => { render(); dd.classList.add('open'); });
+  input.addEventListener('input', render);
+  dd.addEventListener('mousedown', ev => ev.preventDefault());
+  input.addEventListener('blur', () => setTimeout(() => dd.classList.remove('open'), 150));
+}
+
+async function saveDN() {
+  const email = document.getElementById('dn-dev-email').value.trim();
+  const name  = document.getElementById('dn-name-input').value.trim();
+  const alertEl = document.getElementById('dn-form-alert');
+  if (!email || !name) {
+    alertEl.className = 'alert alert-error';
+    alertEl.textContent = 'Выберите разработчика и введите имя';
+    alertEl.style.display = 'block';
+    return;
+  }
+  const resp = await fetch('/api/display-names', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ email, display_name: name }),
+  });
+  const json = await resp.json();
+  if (!json.success) {
+    alertEl.className = 'alert alert-error';
+    alertEl.textContent = '✗ ' + json.error;
+    alertEl.style.display = 'block';
+    return;
+  }
+  hideDNForm();
+  loadDNList();
+}
+
+async function deleteDN(email) {
+  if (!confirm(`Удалить переопределение имени для ${email}?`)) return;
+  await fetch(`/api/display-names/${encodeURIComponent(email)}`, { method: 'DELETE' });
+  loadDNList();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   checkSyncStatus();
   loadSyncLog();
   loadCacheInfo();
   loadEmployees();
   loadAliasGroups();
+  loadTeams();
+  loadDNList();
+  _loadAllEmails();  // preload extended email list for alias form
   _buildAliasSearch('alias-primary-input',   'alias-primary-dd',   'alias-primary-value');
   _buildAliasSearch('alias-secondary-input', 'alias-secondary-dd', 'alias-secondary-value');
+  _buildDNSearch();
   fetch('/api/settings').then(r => r.json()).then(j => {
     if (j.data?.has_pat) loadProjects();
   }).catch(() => {});
