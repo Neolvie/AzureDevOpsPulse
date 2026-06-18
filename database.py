@@ -683,6 +683,7 @@ class Database:
                       SUM(cc.changes_edit) AS total_edit,
                       SUM(cc.changes_delete) AS total_delete,
                       AVG(cc.changes_add+cc.changes_edit+cc.changes_delete) AS avg_changes,
+                      CAST(COUNT(*) AS REAL) / MAX(1, (JULIANDAY(?) - JULIANDAY(?)) / 30.44) AS avg_commits_per_month,
                       MAX(cc.author_date) AS last_commit,
                       COALESCE(MAX(pr_agg.pr_count), 0) AS pr_count,
                       COALESCE(MAX(rv_agg.review_count), 0) AS review_count,
@@ -697,6 +698,7 @@ class Database:
                ORDER BY commit_count DESC""",
             [from_date, to_date,   # pr_agg
              from_date, to_date,   # rv_agg
+             to_date, from_date,   # avg_commits_per_month
              from_date, to_date,   # main WHERE
              *emp_params],
         )
@@ -722,10 +724,11 @@ class Database:
                               SUM(changes_edit) AS total_edit,
                               SUM(changes_delete) AS total_delete,
                               AVG(changes_add+changes_edit+changes_delete) AS avg_changes,
+                              CAST(COUNT(*) AS REAL) / MAX(1, (JULIANDAY(?) - JULIANDAY(?)) / 30.44) AS avg_commits_per_month,
                               MAX(author_date) AS last_commit
                        FROM cc
                        WHERE canonical_email=? AND author_date BETWEEN ? AND ? AND is_merge=0""",
-                    p,
+                    (to_date, from_date, *p),
                 ),
                 "heatmap": self._qc(
                     conn,
