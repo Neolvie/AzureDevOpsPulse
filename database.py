@@ -1354,3 +1354,66 @@ class Database:
             "SELECT MIN(author_date) as min_date, MAX(author_date) as max_date FROM commits"
         )
         return row[0] if row else {"min_date": None, "max_date": None}
+
+
+    def get_monthly_stats(self, from_date: str, to_date: str, employees: list[str] = None) -> dict:
+        """Return monthly PR counts and monthly closed WI counts for the given period."""
+        # PR employee filter
+        pr_logins = [(e.split('@')[0] if '@' in e else e).lower() for e in employees] if employees else []
+        if pr_logins:
+            placeholders = ','.join('?' * len(pr_logins))
+            pr_emp_sql = (
+                ' AND LOWER(CASE WHEN INSTR(creator_email,\'@\')>0'
+                ' THEN SUBSTR(creator_email,1,INSTR(creator_email,\'@\')-1)'
+                ' ELSE creator_email END) IN (' + placeholders + ')'
+            )
+        else:
+            pr_emp_sql = ''
+
+        # WI employee filter
+        if employees:
+            wi_ph = ','.join('?' * len(employees))
+            wi_emp_sql = (
+                ' AND COALESCE(ea.primary_email, lm.canonical_email, LOWER(wi.closed_by_email))'
+                ' IN (' + wi_ph + ')'
+            )
+            wi_emp_params = list(employees)
+        else:
+            wi_emp_sql = ''
+            wi_emp_params = []
+
+        wi_sql = (
+            'WITH ' + _LOGIN_MAP + '''
+            SELECT strftime('%Y-%m', wi.closed_date) AS month, COUNT(*) AS count
+            FROM work_items wi
+            LEFT JOIN employee_aliases ea ON ea.alias_email = LOWER(wi.closed_by_email)
+            LEFT JOIN login_map lm ON lm.login = LOWER(
+                CASE WHEN INSTR(wi.closed_by_email,\'@\')>0
+                     THEN SUBSTR(wi.closed_by_email,1,INSTR(wi.closed_by_email,\'@\')-1)
+                     ELSE wi.closed_by_email END)
+            WHERE wi.closed_by_email IS NOT NULL AND wi.closed_by_email != \'\'
+              AND wi.closed_date BETWEEN ? AND ?'''
+            + wi_emp_sql
+            + ' GROUP BY month ORDER BY month'
+        )
+
+        with self._conn() as conn:
+            monthly_prs = self._qc(
+                conn,
+                (
+                    "SELECT strftime('%Y-%m', created_date) AS month, COUNT(*) AS count"
+                    " FROM pull_requests"
+                    " WHERE created_date BETWEEN ? AND ?" + pr_emp_sql +
+                    " GROUP BY month ORDER BY month"
+                ),
+                [from_date, to_date] + pr_logins,
+            )
+            monthly_wi = self._qc(
+                conn,
+                wi_sql,
+                [from_date, to_date] + wi_emp_params,
+            )
+        return {
+            'monthly_prs': [{'month': r['month'], 'count': r['count']} for r in monthly_prs],
+            'monthly_wi_closed': [{'month': r['month'], 'count': r['count']} for r in monthly_wi],
+        }

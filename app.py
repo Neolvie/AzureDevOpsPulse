@@ -273,6 +273,14 @@ def api_overview():
     return _ok(data)
 
 
+@app.route("/api/monthly-stats")
+def api_monthly_stats():
+    from_date, to_date = _dates()
+    employees = _employee_filter()
+    data = db.get_monthly_stats(from_date, to_date, employees)
+    return _ok(data)
+
+
 @app.route("/api/developers")
 def api_developers():
     from_date, to_date = _dates()
