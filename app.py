@@ -6,7 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, jsonify, render_template, request
+from werkzeug.local import LocalProxy
 
 from collector import TFSClient
 from config import Config
@@ -20,8 +21,41 @@ setup_logger("collector", log_file=cfg.log_file, level=cfg.log_level)
 setup_logger("database", log_file=cfg.log_file, level=cfg.log_level)
 setup_logger("scheduler", log_file=cfg.log_file, level=cfg.log_level)
 
-db = Database(cfg.database_path)
-db.create_tables()
+# ── Multi-instance registry ────────────────────────────────────────────────────
+# Каждый инстанс TFS — отдельная SQLite-база. Активный инстанс выбирается на
+# каждый запрос (параметр ?instance=, тело JSON, либо заголовок X-Instance).
+INSTANCES = cfg.instances
+DBS: dict[str, Database] = {}
+for _inst in INSTANCES:
+    _d = Database(_inst["db_path"])
+    _d.create_tables()
+    DBS[_inst["id"]] = _d
+DEFAULT_INSTANCE = INSTANCES[0]["id"]
+
+
+def _current_instance() -> str:
+    """Определить активный инстанс из запроса. Фолбэк — первый в списке."""
+    iid = request.args.get("instance")
+    if not iid and request.method in ("POST", "PUT", "DELETE"):
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            iid = body.get("instance")
+    if not iid:
+        iid = request.headers.get("X-Instance")
+    if iid not in DBS:
+        iid = DEFAULT_INSTANCE
+    return iid
+
+
+def _get_db() -> Database:
+    if "db" not in g:
+        g.db = DBS[_current_instance()]
+    return g.db
+
+
+# Прокси: существующий код использует `db.<метод>` как раньше, но обращение
+# прозрачно резолвится в БД активного инстанса в рамках текущего запроса.
+db = LocalProxy(_get_db)
 
 app = Flask(__name__)
 
@@ -31,14 +65,14 @@ _CACHE_TTL = 60  # seconds
 
 
 def _cache_get(key: str):
-    entry = _cache.get(key)
+    entry = _cache.get(f"{_current_instance()}|{key}")
     if entry and (time.time() - entry["ts"]) < _CACHE_TTL:
         return entry["data"]
     return None
 
 
 def _cache_set(key: str, data):
-    _cache[key] = {"ts": time.time(), "data": data}
+    _cache[f"{_current_instance()}|{key}"] = {"ts": time.time(), "data": data}
 
 
 def _cache_clear():
@@ -119,6 +153,14 @@ def settings():
 @app.route("/api/health")
 def health():
     return _ok({"status": "ok"})
+
+
+@app.route("/api/instances")
+def api_instances():
+    return _ok({
+        "instances": [{"id": i["id"], "name": i["name"]} for i in INSTANCES],
+        "current": _current_instance(),
+    })
 
 
 @app.route("/api/settings", methods=["GET", "POST"])
@@ -399,7 +441,7 @@ def api_alias_group_delete(primary_email: str):
 
 @app.route("/api/clear-data", methods=["POST"])
 def api_clear_data():
-    if get_sync_status()["running"]:
+    if get_sync_status(_current_instance())["running"]:
         return _err("Нельзя очищать данные во время синхронизации", 409)
     db.clear_data()
     log.info("Data cleared via API")
@@ -408,7 +450,8 @@ def api_clear_data():
 
 @app.route("/api/sync", methods=["POST"])
 def api_sync():
-    if get_sync_status()["running"]:
+    iid = _current_instance()
+    if get_sync_status(iid)["running"]:
         return _err("Синхронизация уже выполняется", 409)
     data = request.get_json(force=True) or {}
     incremental = bool(data.get("incremental", False))
@@ -418,7 +461,9 @@ def api_sync():
     from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     to_date = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     _cache_clear()
-    start_sync_async(db, from_date, to_date, incremental=incremental)
+    # Передаём реальный объект БД (не прокси): синхронизация идёт в отдельном
+    # потоке, где контекст запроса недоступен.
+    start_sync_async(DBS[iid], from_date, to_date, incremental=incremental, instance_id=iid)
     if incremental:
         msg = f"Инкрементальная синхронизация запущена (fallback: {days} дней)"
     else:
@@ -428,7 +473,7 @@ def api_sync():
 
 @app.route("/api/sync-status")
 def api_sync_status():
-    return _ok(get_sync_status())
+    return _ok(get_sync_status(_current_instance()))
 
 
 @app.route("/api/sync-log")
@@ -479,16 +524,17 @@ if __name__ == "__main__":
     log.info("=" * 60)
     log.info("AzureDevOps Pulse запускается")
     log.info("TFS URL (из конфига): %s", cfg.tfs_url)
-    log.info("БД: %s", cfg.database_path)
+    log.info("Инстансы: %s", ", ".join(f"{i['id']} -> {i['db_path']}" for i in INSTANCES))
     log.info("Порт: %s", cfg.server_port)
     log.info("=" * 60)
 
-    s = db.get_settings()
-    if s.get("pat") and s.get("collection"):
-        log.info("Настройки найдены, запускаем планировщик")
-        start_scheduler(db, cfg.sync_interval_hours, cfg.sync_default_period_days)
+    configured = [i["id"] for i in INSTANCES
+                  if DBS[i["id"]].get_settings().get("pat") and DBS[i["id"]].get_settings().get("collection")]
+    if configured:
+        log.info("Настройки найдены для инстансов: %s — запускаем планировщик", ", ".join(configured))
+        start_scheduler(DBS, INSTANCES, cfg.sync_interval_hours, cfg.sync_default_period_days)
     else:
-        log.warning("PAT/коллекция не настроены. Откройте http://localhost:%d/settings", cfg.server_port)
+        log.warning("Ни один инстанс не настроен. Откройте http://localhost:%d/settings", cfg.server_port)
 
     app.run(
         host=cfg.server_host,

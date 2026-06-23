@@ -16,6 +16,17 @@ server:
 database:
   path: "data/pulse.db"
 
+# Несколько инстансов локального TFS. Каждый — отдельная SQLite-база.
+# В UI появляется переключатель; настройки/PAT хранятся внутри каждой БД отдельно.
+# Если список пуст или отсутствует — используется одиночный режим (database.path).
+instances:
+  - id: main
+    name: "Основной TFS"
+    db_path: "data/pulse.db"
+  - id: ir
+    name: "TFS IR"
+    db_path: "data/pulseIR.db"
+
 logging:
   level: "${LOG_LEVEL}"
   file: "logs/app.log"

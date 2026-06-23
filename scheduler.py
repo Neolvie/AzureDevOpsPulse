@@ -10,13 +10,23 @@ from logger import get_logger
 
 log = get_logger("scheduler")
 
-_sync_status: dict = {"running": False, "started_at": None, "message": "", "progress": 0, "total": 0}
+# Статус синхронизации хранится отдельно по каждому инстансу:
+#   _sync_status[instance_id] = {running, started_at, message, progress, total}
+_sync_status: dict = {}
 _scheduler: Optional[BackgroundScheduler] = None
 _lock = threading.Lock()
 
 
-def get_sync_status() -> dict:
-    return dict(_sync_status)
+def _status(instance_id: str) -> dict:
+    """Вернуть (создав при необходимости) словарь статуса для инстанса."""
+    return _sync_status.setdefault(
+        instance_id,
+        {"running": False, "started_at": None, "message": "", "progress": 0, "total": 0},
+    )
+
+
+def get_sync_status(instance_id: str = "default") -> dict:
+    return dict(_status(instance_id))
 
 
 def _last_synced_to_from_date(ts: str, fallback: str) -> str:
@@ -29,21 +39,23 @@ def _last_synced_to_from_date(ts: str, fallback: str) -> str:
         return fallback
 
 
-def run_sync(db: Database, from_date: str, to_date: str, incremental: bool = False):
+def run_sync(db: Database, from_date: str, to_date: str, incremental: bool = False,
+             instance_id: str = "default"):
+    st = _status(instance_id)
     with _lock:
-        if _sync_status["running"]:
-            log.warning("Синхронизация уже запущена, пропуск")
+        if st["running"]:
+            log.warning("[%s] Синхронизация уже запущена, пропуск", instance_id)
             return
         mode = "инкрементальная" if incremental else "полная"
-        _sync_status.update({"running": True, "started_at": datetime.now(timezone.utc).isoformat(),
-                              "message": f"Запуск ({mode})...", "progress": 0, "total": 0})
+        st.update({"running": True, "started_at": datetime.now(timezone.utc).isoformat(),
+                   "message": f"Запуск ({mode})...", "progress": 0, "total": 0})
 
-    log.info("Синхронизация запущена (%s): %s → %s", mode, from_date, to_date)
+    log.info("[%s] Синхронизация запущена (%s): %s → %s", instance_id, mode, from_date, to_date)
     try:
         settings = db.get_settings()
         if not settings.get("pat") or not settings.get("collection"):
-            _sync_status.update({"running": False, "message": "Ошибка: PAT или коллекция не настроены"})
-            log.error("Синхронизация прервана: PAT/коллекция не заданы")
+            st.update({"running": False, "message": "Ошибка: PAT или коллекция не настроены"})
+            log.error("[%s] Синхронизация прервана: PAT/коллекция не заданы", instance_id)
             return
 
         client = TFSClient(
@@ -54,8 +66,8 @@ def run_sync(db: Database, from_date: str, to_date: str, incremental: bool = Fal
 
         ok, msg = client.test_connection()
         if not ok:
-            _sync_status.update({"running": False, "message": f"Ошибка подключения: {msg}"})
-            log.error("Синхронизация прервана: %s", msg)
+            st.update({"running": False, "message": f"Ошибка подключения: {msg}"})
+            log.error("[%s] Синхронизация прервана: %s", instance_id, msg)
             return
 
         all_projects = client.get_projects()
@@ -73,13 +85,13 @@ def run_sync(db: Database, from_date: str, to_date: str, incremental: bool = Fal
             for r in repos:
                 repos_all.append((proj, r))
 
-        _sync_status["total"] = len(repos_all)
-        _sync_status["message"] = f"Найдено {len(repos_all)} репозиториев"
+        st["total"] = len(repos_all)
+        st["message"] = f"Найдено {len(repos_all)} репозиториев"
 
         for i, (proj, repo) in enumerate(repos_all, 1):
             repo_id = repo["id"]
-            _sync_status["progress"] = i
-            _sync_status["message"] = f"[{i}/{len(repos_all)}] {proj['name']} / {repo['name']}"
+            st["progress"] = i
+            st["message"] = f"[{i}/{len(repos_all)}] {proj['name']} / {repo['name']}"
 
             # Инкрементальный режим: берём from_date из last_synced репозитория
             if incremental:
@@ -104,7 +116,7 @@ def run_sync(db: Database, from_date: str, to_date: str, incremental: bool = Fal
         # Work items — синхронизируем по уникальным проектам
         synced_projects = {proj["id"] for proj, _ in repos_all}
         for pi, proj_id in enumerate(synced_projects, 1):
-            _sync_status["message"] = f"Work items [{pi}/{len(synced_projects)}]..."
+            st["message"] = f"Work items [{pi}/{len(synced_projects)}]..."
 
             if incremental:
                 wi_last_ts = db.get_project_wi_last_synced(proj_id)
@@ -117,32 +129,55 @@ def run_sync(db: Database, from_date: str, to_date: str, incremental: bool = Fal
             sync_work_items(client=client, db=db, project_id=proj_id,
                             from_date=wi_from, to_date=to_date)
 
-        _sync_status["message"] = "Обновление карты логинов..."
+        st["message"] = "Обновление карты логинов..."
         db.rebuild_login_map()
-        _sync_status.update({"running": False, "message": f"Завершено ({mode}). Репозиториев: {len(repos_all)}"})
-        log.info("Синхронизация завершена (%s): %d репозиториев", mode, len(repos_all))
+        st.update({"running": False, "message": f"Завершено ({mode}). Репозиториев: {len(repos_all)}"})
+        log.info("[%s] Синхронизация завершена (%s): %d репозиториев", instance_id, mode, len(repos_all))
     except Exception as e:
-        _sync_status.update({"running": False, "message": f"Ошибка: {e}"})
-        log.exception("Синхронизация завершилась с ошибкой")
+        st.update({"running": False, "message": f"Ошибка: {e}"})
+        log.exception("[%s] Синхронизация завершилась с ошибкой", instance_id)
 
 
-def start_sync_async(db: Database, from_date: str, to_date: str, incremental: bool = False):
-    t = threading.Thread(target=run_sync, args=(db, from_date, to_date, incremental), daemon=True)
+def start_sync_async(db: Database, from_date: str, to_date: str, incremental: bool = False,
+                     instance_id: str = "default"):
+    t = threading.Thread(target=run_sync, args=(db, from_date, to_date, incremental, instance_id),
+                         daemon=True)
     t.start()
 
 
-def start_scheduler(db: Database, interval_hours: int, default_period_days: int):
+def start_scheduler(dbs: dict, instances: list, interval_hours: int, default_period_days: int):
+    """Запустить фоновую синхронизацию для всех настроенных инстансов.
+
+    dbs       — {instance_id: Database}
+    instances — [{id, name, db_path}, ...]
+    """
     global _scheduler
-
-    def _job():
-        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        from_date = (datetime.now(timezone.utc) - timedelta(days=default_period_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        run_sync(db, from_date, to_date)
-
     _scheduler = BackgroundScheduler(timezone="UTC")
-    _scheduler.add_job(_job, "interval", hours=interval_hours, id="auto_sync")
-    _scheduler.start()
-    log.info("Планировщик запущен, интервал: %d ч", interval_hours)
+
+    started = 0
+    for inst in instances:
+        iid = inst["id"]
+        db = dbs.get(iid)
+        if db is None:
+            continue
+        s = db.get_settings()
+        if not (s.get("pat") and s.get("collection")):
+            log.info("[%s] Планировщик пропущен: PAT/коллекция не настроены", iid)
+            continue
+
+        def _job(db=db, iid=iid):
+            to_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            from_date = (datetime.now(timezone.utc) - timedelta(days=default_period_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            run_sync(db, from_date, to_date, instance_id=iid)
+
+        _scheduler.add_job(_job, "interval", hours=interval_hours, id=f"auto_sync_{iid}")
+        started += 1
+
+    if started:
+        _scheduler.start()
+        log.info("Планировщик запущен для %d инстанс(ов), интервал: %d ч", started, interval_hours)
+    else:
+        log.warning("Планировщик не запущен: ни один инстанс не настроен")
 
 
 def stop_scheduler():
