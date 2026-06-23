@@ -1,10 +1,13 @@
 import os
 import signal
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, jsonify, render_template, request
+from werkzeug.local import LocalProxy
 
 from collector import TFSClient
 from config import Config
@@ -18,10 +21,62 @@ setup_logger("collector", log_file=cfg.log_file, level=cfg.log_level)
 setup_logger("database", log_file=cfg.log_file, level=cfg.log_level)
 setup_logger("scheduler", log_file=cfg.log_file, level=cfg.log_level)
 
-db = Database(cfg.database_path)
-db.create_tables()
+# ── Multi-instance registry ────────────────────────────────────────────────────
+# Каждый инстанс TFS — отдельная SQLite-база. Активный инстанс выбирается на
+# каждый запрос (параметр ?instance=, тело JSON, либо заголовок X-Instance).
+INSTANCES = cfg.instances
+DBS: dict[str, Database] = {}
+for _inst in INSTANCES:
+    _d = Database(_inst["db_path"])
+    _d.create_tables()
+    DBS[_inst["id"]] = _d
+DEFAULT_INSTANCE = INSTANCES[0]["id"]
+
+
+def _current_instance() -> str:
+    """Определить активный инстанс из запроса. Фолбэк — первый в списке."""
+    iid = request.args.get("instance")
+    if not iid and request.method in ("POST", "PUT", "DELETE"):
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            iid = body.get("instance")
+    if not iid:
+        iid = request.headers.get("X-Instance")
+    if iid not in DBS:
+        iid = DEFAULT_INSTANCE
+    return iid
+
+
+def _get_db() -> Database:
+    if "db" not in g:
+        g.db = DBS[_current_instance()]
+    return g.db
+
+
+# Прокси: существующий код использует `db.<метод>` как раньше, но обращение
+# прозрачно резолвится в БД активного инстанса в рамках текущего запроса.
+db = LocalProxy(_get_db)
 
 app = Flask(__name__)
+
+# ── simple in-memory cache ────────────────────────────────────────────────────
+_cache: dict = {}
+_CACHE_TTL = 60  # seconds
+
+
+def _cache_get(key: str):
+    entry = _cache.get(f"{_current_instance()}|{key}")
+    if entry and (time.time() - entry["ts"]) < _CACHE_TTL:
+        return entry["data"]
+    return None
+
+
+def _cache_set(key: str, data):
+    _cache[f"{_current_instance()}|{key}"] = {"ts": time.time(), "data": data}
+
+
+def _cache_clear():
+    _cache.clear()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -100,6 +155,14 @@ def health():
     return _ok({"status": "ok"})
 
 
+@app.route("/api/instances")
+def api_instances():
+    return _ok({
+        "instances": [{"id": i["id"], "name": i["name"]} for i in INSTANCES],
+        "current": _current_instance(),
+    })
+
+
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
     if request.method == "GET":
@@ -134,11 +197,13 @@ def api_test_connection():
 
 @app.route("/api/employees/all")
 def api_employees_all():
-    authors = db.get_all_authors()
+    cached = _cache_get("employees_all")
+    if cached is None:
+        cached = db.get_all_authors()
+        _cache_set("employees_all", cached)
     selected = set(db.get_selected_employees())
-    for a in authors:
-        a["selected"] = a["author_email"] in selected
-    return _ok(authors)
+    result = [dict(a, selected=(a["author_email"] in selected)) for a in cached]
+    return _ok(result)
 
 
 @app.route("/api/all-emails")
@@ -216,6 +281,7 @@ def api_teams_select():
     except (TypeError, ValueError):
         team_id = 0
     db.save_selected_team(team_id)
+    _cache_clear()
     return _ok({"team_id": team_id})
 
 
@@ -249,17 +315,44 @@ def api_overview():
     return _ok(data)
 
 
+@app.route("/api/monthly-stats")
+def api_monthly_stats():
+    from_date, to_date = _dates()
+    employees = _employee_filter()
+    data = db.get_monthly_stats(from_date, to_date, employees)
+    return _ok(data)
+
+
 @app.route("/api/developers")
 def api_developers():
     from_date, to_date = _dates()
-    return _ok(db.get_developers(from_date, to_date, _employee_filter()))
+    employees = _employee_filter()
+    cache_key = f"devs|{from_date}|{to_date}|{','.join(sorted(employees))}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return _ok(cached)
+    # Run both queries concurrently (WAL allows parallel reads)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_devs = ex.submit(db.get_developers, from_date, to_date, employees)
+        f_wi   = ex.submit(db.get_work_item_stats_all, from_date, to_date, employees)
+        devs     = f_devs.result()
+        wi_stats = f_wi.result()
+    for d in devs:
+        wi = wi_stats.get(d["author_email"], {})
+        d["wi_created"]  = wi.get("created",  0)
+        d["wi_resolved"] = wi.get("resolved", 0)
+        d["wi_closed"]   = wi.get("closed",   0)
+    _cache_set(cache_key, devs)
+    return _ok(devs)
 
 
 @app.route("/api/developer/<path:email>")
 def api_developer(email: str):
     from_date, to_date = _dates()
     email = db.get_canonical_email(email)
-    return _ok(db.get_developer_stats(email, from_date, to_date))
+    data = db.get_developer_stats(email, from_date, to_date)
+    data["work_items"] = db.get_developer_work_item_stats(email, from_date, to_date)
+    return _ok(data)
 
 
 @app.route("/api/compare")
@@ -325,24 +418,30 @@ def api_aliases():
     err = db.add_alias(primary, alias)
     if err:
         return _err(err)
+    db.rebuild_login_map()
+    _cache_clear()
     return _ok({"added": True})
 
 
 @app.route("/api/aliases/<path:alias_email>", methods=["DELETE"])
 def api_alias_delete(alias_email: str):
     db.remove_alias(alias_email)
+    db.rebuild_login_map()
+    _cache_clear()
     return _ok({"removed": True})
 
 
 @app.route("/api/alias-group/<path:primary_email>", methods=["DELETE"])
 def api_alias_group_delete(primary_email: str):
     db.remove_alias_group(primary_email)
+    db.rebuild_login_map()
+    _cache_clear()
     return _ok({"removed": True})
 
 
 @app.route("/api/clear-data", methods=["POST"])
 def api_clear_data():
-    if get_sync_status()["running"]:
+    if get_sync_status(_current_instance())["running"]:
         return _err("Нельзя очищать данные во время синхронизации", 409)
     db.clear_data()
     log.info("Data cleared via API")
@@ -351,21 +450,30 @@ def api_clear_data():
 
 @app.route("/api/sync", methods=["POST"])
 def api_sync():
-    if get_sync_status()["running"]:
+    iid = _current_instance()
+    if get_sync_status(iid)["running"]:
         return _err("Синхронизация уже выполняется", 409)
     data = request.get_json(force=True) or {}
+    incremental = bool(data.get("incremental", False))
     to_dt = datetime.now(timezone.utc)
     days = int(data.get("days", cfg.sync_default_period_days))
     from_dt = to_dt - timedelta(days=days)
     from_date = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     to_date = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    start_sync_async(db, from_date, to_date)
-    return _ok({"message": f"Синхронизация запущена за {days} дней", "from": from_date, "to": to_date})
+    _cache_clear()
+    # Передаём реальный объект БД (не прокси): синхронизация идёт в отдельном
+    # потоке, где контекст запроса недоступен.
+    start_sync_async(DBS[iid], from_date, to_date, incremental=incremental, instance_id=iid)
+    if incremental:
+        msg = f"Инкрементальная синхронизация запущена (fallback: {days} дней)"
+    else:
+        msg = f"Синхронизация запущена за {days} дней"
+    return _ok({"message": msg, "from": from_date, "to": to_date, "incremental": incremental})
 
 
 @app.route("/api/sync-status")
 def api_sync_status():
-    return _ok(get_sync_status())
+    return _ok(get_sync_status(_current_instance()))
 
 
 @app.route("/api/sync-log")
@@ -416,16 +524,17 @@ if __name__ == "__main__":
     log.info("=" * 60)
     log.info("AzureDevOps Pulse запускается")
     log.info("TFS URL (из конфига): %s", cfg.tfs_url)
-    log.info("БД: %s", cfg.database_path)
+    log.info("Инстансы: %s", ", ".join(f"{i['id']} -> {i['db_path']}" for i in INSTANCES))
     log.info("Порт: %s", cfg.server_port)
     log.info("=" * 60)
 
-    s = db.get_settings()
-    if s.get("pat") and s.get("collection"):
-        log.info("Настройки найдены, запускаем планировщик")
-        start_scheduler(db, cfg.sync_interval_hours, cfg.sync_default_period_days)
+    configured = [i["id"] for i in INSTANCES
+                  if DBS[i["id"]].get_settings().get("pat") and DBS[i["id"]].get_settings().get("collection")]
+    if configured:
+        log.info("Настройки найдены для инстансов: %s — запускаем планировщик", ", ".join(configured))
+        start_scheduler(DBS, INSTANCES, cfg.sync_interval_hours, cfg.sync_default_period_days)
     else:
-        log.warning("PAT/коллекция не настроены. Откройте http://localhost:%d/settings", cfg.server_port)
+        log.warning("Ни один инстанс не настроен. Откройте http://localhost:%d/settings", cfg.server_port)
 
     app.run(
         host=cfg.server_host,

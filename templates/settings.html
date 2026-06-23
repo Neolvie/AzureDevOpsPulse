@@ -111,9 +111,13 @@
         </div>
 
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-          <button class="btn btn-primary" id="btn-sync" onclick="startSync()">
+          <button class="btn btn-primary" id="btn-sync-incremental" onclick="startSync(true)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-            Синхронизировать сейчас
+            Дозагрузить новое
+          </button>
+          <button class="btn btn-secondary" id="btn-sync" onclick="startSync(false)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            Полная синхронизация
           </button>
           <button class="btn btn-danger" id="btn-clear" onclick="clearAndSync()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
@@ -122,6 +126,9 @@
         </div>
 
         <div style="margin-top:12px;font-size:.8rem;color:var(--text-muted)">
+          <span id="last-sync-info"></span><br>
+          «Дозагрузить новое» — загружает только данные с момента последней синхронизации каждого репозитория.<br>
+          «Полная синхронизация» — перезагружает данные за выбранный период целиком.<br>
           Автоматическая синхронизация запускается каждые 6 часов, если настроены учётные данные.
         </div>
       </div>
@@ -392,15 +399,21 @@ async function clearAndSync() {
   }
 }
 
-async function startSync() {
-  const btn = document.getElementById('btn-sync');
-  btn.disabled = true;
+function setSyncButtonsDisabled(disabled) {
+  ['btn-sync', 'btn-sync-incremental'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = disabled;
+  });
+}
+
+async function startSync(incremental = false) {
+  setSyncButtonsDisabled(true);
   const days = document.getElementById('sync-days').value;
   try {
     const resp = await fetch('/api/sync', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ days: parseInt(days) }),
+      body: JSON.stringify({ days: parseInt(days), incremental }),
     });
     const json = await resp.json();
     if (json.success) {
@@ -408,11 +421,11 @@ async function startSync() {
       pollSyncStatus();
     } else {
       showAlert('sync-alert', '✗ ' + json.error, 'error');
-      btn.disabled = false;
+      setSyncButtonsDisabled(false);
     }
   } catch(e) {
     showAlert('sync-alert', '✗ ' + e.message, 'error');
-    btn.disabled = false;
+    setSyncButtonsDisabled(false);
   }
 }
 
@@ -426,10 +439,11 @@ async function pollSyncStatus() {
       updateSyncUI(s);
       if (!s.running) {
         clearInterval(syncPoller);
-        document.getElementById('btn-sync').disabled = false;
+        setSyncButtonsDisabled(false);
         loadSyncLog();
         loadCacheInfo();
         loadEmployees();
+        loadLastSyncInfo();
       }
     } catch(_) {}
   }, 1500);
@@ -518,8 +532,25 @@ async function checkSyncStatus() {
     const json = await resp.json();
     updateSyncUI(json.data);
     if (json.data.running) {
-      document.getElementById('btn-sync').disabled = true;
+      setSyncButtonsDisabled(true);
       pollSyncStatus();
+    }
+  } catch(_) {}
+}
+
+async function loadLastSyncInfo() {
+  try {
+    const resp = await fetch('/api/sync-log?limit=1');
+    const json = await resp.json();
+    const el = document.getElementById('last-sync-info');
+    if (!el) return;
+    const entry = json.data?.[0];
+    if (entry) {
+      const dt = new Date(entry.timestamp);
+      const fmt = dt.toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+      el.textContent = `Последняя синхронизация: ${fmt}`;
+    } else {
+      el.textContent = 'Синхронизация ещё не выполнялась.';
     }
   } catch(_) {}
 }
@@ -541,6 +572,11 @@ async function loadEmployees() {
     const json = await resp.json();
     if (!json.success) { list.innerHTML = `<div class="alert alert-error" style="margin:12px">${json.error}</div>`; return; }
     _allEmployees = json.data || [];
+    // Переиспользуем для секции Команды — не нужен повторный запрос
+    if (!_devEmailsLoaded) {
+      _allDevEmails = _allEmployees.map(e => ({ email: e.author_email, name: e.author_name || e.author_email }));
+      _devEmailsLoaded = true;
+    }
     renderEmpList();
     updateEmpBadge();
   } catch(e) {
@@ -893,22 +929,53 @@ async function removeAliasGroup(primaryEmail) {
 
 // ── Teams ──────────────────────────────────────────────────────────────────────
 
-let _allDevEmails = [];  // [{author_email, author_name}] for member search
+let _allDevEmails = [];  // [{email, name}] for member search — loaded once
+let _devEmailsLoaded = false;
+
+async function _ensureDevEmails() {
+  if (_devEmailsLoaded) return;
+  try {
+    const resp = await fetch('/api/employees/all');
+    const json = await resp.json();
+    _allDevEmails = (json.data || []).map(d => ({ email: d.author_email, name: d.author_name || d.author_email }));
+    _devEmailsLoaded = true;
+  } catch(_) {}
+}
 
 async function loadTeams() {
-  const [teamsResp, devsResp] = await Promise.all([
-    fetch('/api/teams').then(r => r.json()),
-    fetch('/api/employees/all').then(r => r.json()),
-  ]);
-  const teams = teamsResp.data || [];
-  _allDevEmails = (devsResp.data || []).map(d => ({ email: d.author_email, name: d.author_name || d.author_email }));
-
+  await _ensureDevEmails();
   const wrap = document.getElementById('teams-list');
-  if (!teams.length) {
-    wrap.innerHTML = '<div class="empty">Нет команд. Создайте первую.</div>';
-    return;
+  wrap.innerHTML = '<div class="loading"><div class="spinner"></div> Загрузка...</div>';
+  try {
+    const resp = await fetch('/api/teams');
+    const json = await resp.json();
+    const teams = json.data || [];
+    if (!teams.length) {
+      wrap.innerHTML = '<div class="empty">Нет команд. Создайте первую.</div>';
+      return;
+    }
+    wrap.innerHTML = teams.map(t => renderTeamCard(t)).join('');
+    teams.forEach(t => _buildAliasSearch(`add-member-input-${t.id}`, `member-suggest-${t.id}`, `add-member-email-${t.id}`));
+  } catch(e) {
+    wrap.innerHTML = `<div class="alert alert-error" style="margin:0">${e.message}</div>`;
   }
-  wrap.innerHTML = teams.map(t => renderTeamCard(t)).join('');
+}
+
+// Обновляет только одну карточку команды без полной перезагрузки
+async function _reloadTeamCard(teamId) {
+  await _ensureDevEmails();
+  try {
+    const resp = await fetch('/api/teams');
+    const json = await resp.json();
+    const team = (json.data || []).find(t => t.id === teamId);
+    if (!team) { loadTeams(); return; }
+    const card = document.getElementById(`team-card-${teamId}`);
+    if (!card) { loadTeams(); return; }
+    card.outerHTML = renderTeamCard(team);
+    _buildAliasSearch(`add-member-input-${teamId}`, `member-suggest-${teamId}`, `add-member-email-${teamId}`);
+  } catch(_) {
+    loadTeams();
+  }
 }
 
 function renderTeamCard(t) {
@@ -928,7 +995,7 @@ function renderTeamCard(t) {
   }).join('');
 
   return `
-    <div class="panel" style="margin-bottom:12px;border:1px solid var(--border)" id="team-card-${t.id}">
+    <div class="panel" style="margin-bottom:12px;border:1px solid var(--border);overflow:visible" id="team-card-${t.id}">
       <div class="panel-header" style="padding:10px 16px">
         <div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">
           <span id="team-name-${t.id}" style="font-weight:600">${t.name}</span>
@@ -948,11 +1015,10 @@ function renderTeamCard(t) {
           <div style="flex:1;position:relative">
             <input type="text" class="form-input" id="add-member-input-${t.id}"
                    placeholder="Поиск по имени или email..."
-                   style="font-size:.82rem;padding:5px 10px"
-                   oninput="showMemberSuggest(${t.id})"
-                   onkeydown="if(event.key==='Escape') hideMemberSuggest(${t.id})">
-            <div id="member-suggest-${t.id}" class="dev-picker-dropdown" style="top:100%;z-index:300"></div>
+                   style="font-size:.82rem;padding:5px 10px" autocomplete="off">
+            <div id="member-suggest-${t.id}" class="dev-picker-dropdown" style="z-index:300"></div>
           </div>
+          <input type="hidden" id="add-member-email-${t.id}">
           <button class="btn btn-primary" style="padding:5px 12px;font-size:.82rem;flex-shrink:0"
                   onclick="addMemberFromInput(${t.id})">+ Добавить</button>
         </div>
@@ -960,47 +1026,20 @@ function renderTeamCard(t) {
     </div>`;
 }
 
-function showMemberSuggest(teamId) {
-  const input = document.getElementById(`add-member-input-${teamId}`);
-  const dd = document.getElementById(`member-suggest-${teamId}`);
-  const q = (input.value || '').toLowerCase();
-  const matches = _allDevEmails.filter(d =>
-    d.name.toLowerCase().includes(q) || d.email.toLowerCase().includes(q)
-  ).slice(0, 10);
-  if (!matches.length) { dd.classList.remove('open'); return; }
-  dd.innerHTML = matches.map(d => `
-    <div class="dev-option" data-email="${d.email}"
-         onmousedown="pickMember(${teamId},'${d.email}','${d.name.replace(/'/g,"\\'")}')">
-      <div class="avatar" style="background:${avatarColor(d.email)};width:24px;height:24px;font-size:.7rem">${avatar(d.name)}</div>
-      <div><div class="dev-name" style="font-size:.82rem">${d.name}</div><div class="dev-email" style="font-size:.73rem">${d.email}</div></div>
-    </div>`).join('');
-  dd.classList.add('open');
-}
-
-function hideMemberSuggest(teamId) {
-  const dd = document.getElementById(`member-suggest-${teamId}`);
-  if (dd) { dd.classList.remove('open'); dd.innerHTML = ''; }
-}
-
-function pickMember(teamId, email, name) {
-  const input = document.getElementById(`add-member-input-${teamId}`);
-  input.value = name;
-  input.dataset.pickedEmail = email;
-  hideMemberSuggest(teamId);
-}
 
 async function addMemberFromInput(teamId) {
-  const input = document.getElementById(`add-member-input-${teamId}`);
-  const email = input.dataset.pickedEmail || input.value.trim().toLowerCase();
+  const input  = document.getElementById(`add-member-input-${teamId}`);
+  const hidden = document.getElementById(`add-member-email-${teamId}`);
+  const email  = (hidden && hidden.value.trim()) || input.value.trim().toLowerCase();
   if (!email) return;
   await fetch(`/api/teams/${teamId}/members`, {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ email }),
   });
-  input.value = '';
-  delete input.dataset.pickedEmail;
-  loadTeams();
+  input.value  = '';
+  if (hidden) hidden.value = '';
+  _reloadTeamCard(teamId);
 }
 
 async function removeTeamMember(teamId, email) {
@@ -1009,7 +1048,7 @@ async function removeTeamMember(teamId, email) {
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ email }),
   });
-  loadTeams();
+  _reloadTeamCard(teamId);
 }
 
 async function deleteTeam(teamId, name) {
@@ -1042,7 +1081,7 @@ async function saveRenameTeam(teamId) {
   });
   const json = await resp.json();
   if (!json.success) { alert(json.error); return; }
-  loadTeams();
+  _reloadTeamCard(teamId);
 }
 
 function showCreateTeamForm() {
@@ -1191,10 +1230,11 @@ async function deleteDN(email) {
 document.addEventListener('DOMContentLoaded', () => {
   checkSyncStatus();
   loadSyncLog();
+  loadLastSyncInfo();
   loadCacheInfo();
-  loadEmployees();
+  // loadEmployees уже заполнит _allDevEmails; loadTeams дождётся через _ensureDevEmails
+  loadEmployees().then(() => loadTeams());
   loadAliasGroups();
-  loadTeams();
   loadDNList();
   _loadAllEmails();  // preload extended email list for alias form
   _buildAliasSearch('alias-primary-input',   'alias-primary-dd',   'alias-primary-value');

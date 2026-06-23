@@ -2,6 +2,9 @@
 {% block title %}Обзор — DevOps Pulse{% endblock %}
 
 {% block content %}
+<style>
+#dev-table th { padding: 6px 8px; font-size: .65rem; }
+</style>
 <div class="page-header">
   <h1>Обзор команды</h1>
   <p>Активность разработчиков по всем репозиториям</p>
@@ -28,6 +31,40 @@
   <div class="card"><div class="card-label">Разработчиков</div><div class="card-value" id="c-devs">—</div><div class="card-sub">активных</div></div>
   <div class="card"><div class="card-label">Репозиториев</div><div class="card-value" id="c-repos">—</div><div class="card-sub">всего</div></div>
   <div class="card"><div class="card-label">Pull Requests</div><div class="card-value" id="c-prs">—</div><div class="card-sub">за период</div></div>
+  <div class="card"><div class="card-label">WI закрыто</div><div class="card-value" id="c-wi-closed">—</div><div class="card-sub">за период</div></div>
+</div>
+
+<!-- Monthly charts -->
+<div class="grid-2">
+  <div class="panel">
+    <div class="panel-header"><span class="panel-title">Pull Requests по месяцам</span></div>
+    <div class="panel-body">
+      <div class="chart-wrap" style="height:240px">
+        <canvas id="chart-monthly-prs"></canvas>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-header"><span class="panel-title">Закрытые WI по месяцам</span></div>
+    <div class="panel-body">
+      <div class="chart-wrap" style="height:240px">
+        <canvas id="chart-monthly-wi"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Developer list -->
+<div class="panel">
+  <div class="panel-header">
+    <span class="panel-title">Разработчики</span>
+    <small id="dev-count" style="color:var(--text-muted);font-size:.8rem"></small>
+  </div>
+  <div class="panel-body" style="padding:0">
+    <div class="table-wrap" id="dev-table">
+      <div class="loading"><div class="spinner"></div></div>
+    </div>
+  </div>
 </div>
 
 <!-- Team pulse -->
@@ -75,25 +112,95 @@
     </div>
   </div>
 </div>
-
-<!-- Developer list -->
-<div class="panel">
-  <div class="panel-header">
-    <span class="panel-title">Разработчики</span>
-    <small id="dev-count" style="color:var(--text-muted);font-size:.8rem"></small>
-  </div>
-  <div class="panel-body" style="padding:0">
-    <div class="table-wrap" id="dev-table">
-      <div class="loading"><div class="spinner"></div></div>
-    </div>
-  </div>
-</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
 let chartTop = null;
 let _topContributors = [];
+let chartMonthlyPrs = null;
+let chartMonthlyWi = null;
+
+// ── Linear regression trend line ─────────────────────────────────────────────
+function linearTrend(values) {
+  const n = values.length;
+  if (n < 2) return values.map(() => (values[0] || 0));
+  const xs = values.map((_, i) => i);
+  const sumX  = xs.reduce((a, b) => a + b, 0);
+  const sumY  = values.reduce((a, b) => a + b, 0);
+  const sumXY = xs.reduce((s, x, i) => s + x * values[i], 0);
+  const sumX2 = xs.reduce((s, x) => s + x * x, 0);
+  const denom = n * sumX2 - sumX * sumX;
+  if (denom === 0) return values.map(() => sumY / n);
+  const slope     = (n * sumXY - sumX * sumY) / denom;
+  const intercept = (sumY - slope * sumX) / n;
+  return xs.map(x => Math.max(0, Math.round((slope * x + intercept) * 10) / 10));
+}
+
+function renderMonthlyChart(canvasId, chartRef, data, color, label) {
+  const el = document.getElementById(canvasId);
+  if (chartRef) chartRef.destroy();
+  if (!data || !data.length) { empty(el.parentElement, 'Нет данных'); return null; }
+  const labels = data.map(d => d.month);
+  const values = data.map(d => d.count);
+  const trend  = linearTrend(values);
+  return new Chart(el, {
+    data: {
+      labels,
+      datasets: [
+        {
+          type: 'bar',
+          label,
+          data: values,
+          backgroundColor: color + '99',
+          borderColor: color,
+          borderWidth: 1,
+          borderRadius: 3,
+          order: 2,
+        },
+        {
+          type: 'line',
+          label: 'Тренд',
+          data: trend,
+          borderColor: '#f0883e',
+          borderWidth: 2,
+          borderDash: [5, 4],
+          pointRadius: 0,
+          tension: 0.3,
+          fill: false,
+          order: 1,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: true, labels: { boxWidth: 12, padding: 12 } },
+      },
+      scales: {
+        x: { grid: { color: '#21262d' }, ticks: { maxTicksLimit: 12 } },
+        y: { grid: { color: '#21262d' }, beginAtZero: true },
+      },
+    },
+  });
+}
+
+async function loadMonthlyStats() {
+  try {
+    const data = await api('/api/monthly-stats');
+    chartMonthlyPrs = renderMonthlyChart(
+      'chart-monthly-prs', chartMonthlyPrs,
+      data.monthly_prs, '#1f6feb', 'Pull Requests'
+    );
+    chartMonthlyWi = renderMonthlyChart(
+      'chart-monthly-wi', chartMonthlyWi,
+      data.monthly_wi_closed, '#3fb950', 'WI закрыто'
+    );
+  } catch(e) {
+    console.error('monthly-stats error', e);
+  }
+}
 let _topMetric = 'commit_count';
 let _chartDir = 'desc';
 
@@ -140,13 +247,15 @@ function renderTopChart() {
 }
 
 async function loadOverview() {
+  loadMonthlyStats();
   try {
     const data = await api('/api/overview');
 
-    document.getElementById('c-commits').textContent = fmt(data.total_commits);
-    document.getElementById('c-devs').textContent    = fmt(data.active_devs);
-    document.getElementById('c-repos').textContent   = fmt(data.total_repos);
-    document.getElementById('c-prs').textContent     = fmt(data.total_prs);
+    document.getElementById('c-commits').textContent   = fmt(data.total_commits);
+    document.getElementById('c-devs').textContent      = fmt(data.active_devs);
+    document.getElementById('c-repos').textContent     = fmt(data.total_repos);
+    document.getElementById('c-prs').textContent       = fmt(data.total_prs);
+    document.getElementById('c-wi-closed').textContent = fmt(data.total_wi_closed);
 
     const weeks = State.fromDate
       ? Math.ceil((new Date(State.toDate) - new Date(State.fromDate)) / (7*86400000)) + 1
@@ -263,6 +372,11 @@ function renderDevTable() {
         <th style="${thStyle}" onclick="sortTable('total_add')">Добавлено${_sortIndicator('total_add')}</th>
         <th style="${thStyle}" onclick="sortTable('total_edit')">Изменено${_sortIndicator('total_edit')}</th>
         <th style="${thStyle}" onclick="sortTable('total_delete')">Удалено${_sortIndicator('total_delete')}</th>
+        <th style="${thStyle}" onclick="sortTable('avg_changes')" title="Среднее число изменений на коммит">Ср. изм./коммит${_sortIndicator('avg_changes')}</th>
+        <th style="${thStyle}" onclick="sortTable('avg_commits_per_month')" title="Среднее количество коммитов в месяц за выбранный период">Коммитов/мес${_sortIndicator('avg_commits_per_month')}</th>
+        <th style="${thStyle}" onclick="sortTable('wi_created')"  title="Work items: создано">WI создано${_sortIndicator('wi_created')}</th>
+        <th style="${thStyle}" onclick="sortTable('wi_resolved')" title="Work items: решено">WI решено${_sortIndicator('wi_resolved')}</th>
+        <th style="${thStyle}" onclick="sortTable('wi_closed')"   title="Work items: закрыто">WI закрыто${_sortIndicator('wi_closed')}</th>
         <th style="${thStyle}" onclick="sortTable('last_commit')">Последний коммит${_sortIndicator('last_commit')}</th>
       </tr></thead>
       <tbody>${sorted.map((d, i) => `
@@ -297,6 +411,11 @@ function renderDevTable() {
           <td><span class="changes-add">+${fmt(d.total_add||0)}</span></td>
           <td><span style="color:#388bfd">${fmt(d.total_edit||0)}</span></td>
           <td><span class="changes-del">-${fmt(d.total_delete||0)}</span></td>
+          <td style="white-space:nowrap">${d.avg_changes ? Math.round(d.avg_changes) : '—'}</td>
+          <td style="white-space:nowrap">${d.avg_commits_per_month ? d.avg_commits_per_month.toFixed(1) : '—'}</td>
+          <td>${d.wi_created  || '—'}</td>
+          <td>${d.wi_resolved || '—'}</td>
+          <td>${d.wi_closed   || '—'}</td>
           <td>${fmtDate(d.last_commit)}</td>
         </tr>
       `).join('')}</tbody>

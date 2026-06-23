@@ -32,6 +32,10 @@
   <div class="card"><div class="card-label">PR создано</div><div class="card-value" id="s-prs">—</div></div>
   <div class="card"><div class="card-label">Активных дней</div><div class="card-value" id="s-days">—</div></div>
   <div class="card"><div class="card-label">Ср. изменений</div><div class="card-value" id="s-avg">—</div><div class="card-sub">на коммит</div></div>
+  <div class="card"><div class="card-label">Коммитов</div><div class="card-value" id="s-cpm">—</div><div class="card-sub">в месяц</div></div>
+  <div class="card"><div class="card-label">WI создано</div><div class="card-value" id="s-wi-created">—</div><div class="card-sub">work items</div></div>
+  <div class="card"><div class="card-label">WI решено</div><div class="card-value" id="s-wi-resolved">—</div><div class="card-sub">work items</div></div>
+  <div class="card"><div class="card-label">WI закрыто</div><div class="card-value" id="s-wi-closed">—</div><div class="card-sub">work items</div></div>
   <div class="card"><div class="card-label">Последний коммит</div><div class="card-value" style="font-size:1rem" id="s-last">—</div></div>
 </div>
 
@@ -49,9 +53,9 @@
     <div class="panel-header">
       <span class="panel-title">Частота коммитов</span>
       <div class="chart-toggle">
-        <button class="btn-toggle active" data-granularity="day">День</button>
+        <button class="btn-toggle" data-granularity="day">День</button>
         <button class="btn-toggle" data-granularity="week">Неделя</button>
-        <button class="btn-toggle" data-granularity="month">Месяц</button>
+        <button class="btn-toggle active" data-granularity="month">Месяц</button>
       </div>
     </div>
     <div class="panel-body"><div class="chart-wrap"><canvas id="chart-freq" height="180"></canvas></div></div>
@@ -120,7 +124,7 @@ const EMAIL = '{{ email }}';
 let dailyData = [];
 let chartFreq = null, chartSize = null, chartPrs = null, chartRepos = null;
 let _devData = null;
-let granularity = 'day';
+let granularity = 'month';
 let granularity2 = 'day';
 
 function aggregateByGranularity(daily, gran) {
@@ -198,6 +202,11 @@ async function loadDeveloper() {
     document.getElementById('s-prs').textContent = fmt(data.pr_stats?.reduce((a,r)=>a+r.count,0));
     document.getElementById('s-days').textContent = fmt(sum.active_days);
     document.getElementById('s-avg').textContent = sum.avg_changes ? Math.round(sum.avg_changes) : '—';
+    document.getElementById('s-cpm').textContent = sum.avg_commits_per_month ? sum.avg_commits_per_month.toFixed(1) : '—';
+    const wi = data.work_items || {};
+    document.getElementById('s-wi-created').textContent  = wi.created  ?? '—';
+    document.getElementById('s-wi-resolved').textContent = wi.resolved ?? '—';
+    document.getElementById('s-wi-closed').textContent   = wi.closed   ?? '—';
     document.getElementById('s-last').textContent = fmtDate(sum.last_commit);
 
     // Heatmap

@@ -81,6 +81,28 @@ class Config:
         return self.get("database", "path", default="data/pulse.db")
 
     @property
+    def instances(self) -> list:
+        """Список инстансов TFS: [{id, name, db_path}, ...].
+
+        Если в конфиге задан непустой `instances` — возвращаем его (с валидацией
+        и дедупликацией id). Иначе — одиночный инстанс из `database.path`."""
+        raw = self.get("instances", default=None) or []
+        result = []
+        seen = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            iid = str(item.get("id") or "").strip()
+            db_path = (item.get("db_path") or "").strip()
+            if not iid or not db_path or iid in seen:
+                continue
+            seen.add(iid)
+            result.append({"id": iid, "name": (item.get("name") or iid), "db_path": db_path})
+        if not result:
+            result = [{"id": "default", "name": "TFS", "db_path": self.database_path}]
+        return result
+
+    @property
     def log_level(self) -> str:
         return self.get("logging", "level", default="INFO")
 
